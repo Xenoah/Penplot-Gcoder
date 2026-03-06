@@ -447,3 +447,4 @@ opencv-python>=4.8.0
 | 2026-03-06 | v3 | タッチダウン後ディレイ・リフトアップ前ディレイ追加。ペンオフセット連動の有効描画エリア自動計算追加。3Dプレビュー機能追加 (Z軸誇張倍率・視点ショートカット・アニメーション) | ユーザー要件追加 |
 | 2026-03-06 | v4 | 3Dプレビューライブラリをpyqtgraphに確定。2DプレビューをQPainterに確定。PNG/JPG処理をcv2に確定。プロジェクトファイル構成追加。SVG複数色グループ対応追加。Undo/Redo (QUndoStack) 追加。requirements.txt確定。 | ユーザー承認・実装開始前の仕様確定 |
 | 2026-03-06 | v5 | 全機能を実装完了。main.py / src/ ディレクトリ全体 / profiles/ を新規作成。models (settings.py, pen_path.py)、core (bed_calculator, path_optimizer, fill_generator, gcode_generator, importers)、ui (main_window, settings_panel, preview_2d, preview_3d, path_list) を実装。 | 実装完了 |
+| 2026-03-07 | v6 | main.py に自動パッケージインストール機能追加 (_check_and_install)。setup.bat 作成 (pip install + python main.py を一括実行)。 | 初回セットアップの簡略化 |
