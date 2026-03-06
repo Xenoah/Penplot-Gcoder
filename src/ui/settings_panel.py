@@ -50,6 +50,8 @@ class SettingsPanel(QWidget):
         self._tabs.addTab(self._build_path_tab(), "Path")
         self._tabs.addTab(self._build_fill_tab(), "Fill")
         self._tabs.addTab(self._build_gcode_tab(), "GCode")
+        # All widgets built — safe to call now
+        self._on_fill_pattern_changed()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -267,8 +269,6 @@ class SettingsPanel(QWidget):
         for cb in [self._fill_target, self._fill_layer_order, self._fill_pattern,
                    self._contour_innermost, self._dots_grid]:
             cb.currentTextChanged.connect(self._on_any_changed)
-
-        self._on_fill_pattern_changed()
         return w
 
     def _make_form_row(self, label: str, widget: QWidget) -> QWidget:
