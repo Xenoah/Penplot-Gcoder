@@ -1,0 +1,7 @@
+{
+  "name": "Prusa-MK3",
+  "bed_x": 250,
+  "bed_y": 210,
+  "firmware": "Marlin",
+  "origin": "left_bottom"
+}

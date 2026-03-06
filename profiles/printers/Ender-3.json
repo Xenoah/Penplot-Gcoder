@@ -1,0 +1,7 @@
+{
+  "name": "Ender-3",
+  "bed_x": 220,
+  "bed_y": 220,
+  "firmware": "Marlin",
+  "origin": "left_bottom"
+}

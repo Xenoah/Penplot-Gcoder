@@ -1,0 +1,7 @@
+{
+  "name": "Creality-CR10",
+  "bed_x": 300,
+  "bed_y": 300,
+  "firmware": "Marlin",
+  "origin": "left_bottom"
+}
