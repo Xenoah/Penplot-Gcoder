@@ -65,6 +65,13 @@ class Preview3D(QWidget):
         self.groups = groups
         self._rebuild()
 
+    def set_draw_limit(self, n: int):
+        """Show only the first n paths (−1 = all). Used by seekbar."""
+        all_paths = [p for g in self.groups for p in g.paths]
+        limit = n if n >= 0 else len(all_paths)
+        self._clear_path_items()
+        self._add_path_items(all_paths[:limit])
+
     def start_animation(self):
         self._clear_path_items()
         self._anim_all_paths = [p for g in self.groups for p in g.paths]

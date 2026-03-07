@@ -435,6 +435,12 @@ opencv-python>=4.8.0
 | 実装 | ペンオフセット・有効エリア計算 | 完了 |
 | 実装 | GCodeタブ (開始・終了コードエディタ) | 完了 |
 | 実装 | プロファイル管理 | 完了 |
+| 実装 | シークバー (再生/一時停止) | 完了 |
+| 実装 | Raw ビュー修正 (スケール適用後表示) | 完了 |
+| 実装 | 複数ファイル同時インポート | 完了 |
+| 実装 | 設定自動保存 (autosave.json / デバウンス1秒) | 完了 |
+| 実装 | プロファイル追加・保存・削除 (全設定対応) | 完了 |
+| 実装 | .gitignore 作成 | 完了 |
 
 ---
 
@@ -448,3 +454,6 @@ opencv-python>=4.8.0
 | 2026-03-06 | v4 | 3Dプレビューライブラリをpyqtgraphに確定。2DプレビューをQPainterに確定。PNG/JPG処理をcv2に確定。プロジェクトファイル構成追加。SVG複数色グループ対応追加。Undo/Redo (QUndoStack) 追加。requirements.txt確定。 | ユーザー承認・実装開始前の仕様確定 |
 | 2026-03-06 | v5 | 全機能を実装完了。main.py / src/ ディレクトリ全体 / profiles/ を新規作成。models (settings.py, pen_path.py)、core (bed_calculator, path_optimizer, fill_generator, gcode_generator, importers)、ui (main_window, settings_panel, preview_2d, preview_3d, path_list) を実装。 | 実装完了 |
 | 2026-03-07 | v6 | main.py に自動パッケージインストール機能追加 (_check_and_install)。setup.bat 作成 (pip install + python main.py を一括実行)。 | 初回セットアップの簡略化 |
+| 2026-03-07 | v9 | シークバー追加 (▶/⏸ ボタン + QSlider でパス再生)。Raw ビュー修正 (スケールのみ適用した座標で表示)。複数ファイル同時インポート対応 (getOpenFileNames)。設定自動保存機能追加 (profiles/user/autosave.json に1秒デバウンス保存、起動時自動復元)。プロファイル管理強化 (New/Save/Delete ボタン追加、全 AppSettings を JSON 保存/読み込み、path placement は保持)。.gitignore 作成 (profiles/user/ を除外)。 | ユーザー要件追加 |
+| 2026-03-07 | v7 | UI をタブベース5ステップフロー (① 配置 / ② 設定 / ③ 生成 / ④ 確認 / ⑤ 出力) に再構築。ファイルパス問題 (日本語・記号・長パス) を一時コピーで修正 (_safe_filepath)。自動フィット・カーソル座標・ドラッグ操作は配置タブに統合。 | ユーザー要件追加 |
+| 2026-03-07 | v8 | UIをChituboxライクな1画面構成に全面再設計。左=設定パネル/中央=プレビュー(Raw 2D・変換後 2D・3D切り替え)/右=パスリスト+統計/下部バー=配置コントロール+アクションボタン。ファイル読み込み時にRaw→変換後を自動切り替えで両方確認できる。 | ユーザー要件変更 |

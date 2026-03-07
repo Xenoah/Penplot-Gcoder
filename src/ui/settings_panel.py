@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -10,6 +11,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox,
     QPushButton, QTextEdit, QGroupBox, QTabWidget, QSizePolicy,
+    QInputDialog, QMessageBox,
 )
 from src.models.settings import AppSettings
 
@@ -74,6 +76,18 @@ class SettingsPanel(QWidget):
         self._profile_combo.addItem("Custom")
         form.addRow("Printer Profile:", self._profile_combo)
 
+        # Profile management buttons
+        btn_row = QHBoxLayout()
+        self._btn_new_profile  = QPushButton("New")
+        self._btn_save_profile = QPushButton("Save")
+        self._btn_del_profile  = QPushButton("Delete")
+        for b in (self._btn_new_profile, self._btn_save_profile, self._btn_del_profile):
+            b.setFixedHeight(22)
+            btn_row.addWidget(b)
+        profile_btn_widget = QWidget()
+        profile_btn_widget.setLayout(btn_row)
+        form.addRow("", profile_btn_widget)
+
         self._firmware_combo = QComboBox()
         self._firmware_combo.addItems(["Marlin", "Klipper"])
         form.addRow("Firmware:", self._firmware_combo)
@@ -93,6 +107,9 @@ class SettingsPanel(QWidget):
 
         # Signals
         self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        self._btn_new_profile.clicked.connect(self._on_new_profile)
+        self._btn_save_profile.clicked.connect(self._on_save_profile)
+        self._btn_del_profile.clicked.connect(self._on_del_profile)
         self._firmware_combo.currentTextChanged.connect(self._on_any_changed)
         self._bed_x.valueChanged.connect(self._on_any_changed)
         self._bed_y.valueChanged.connect(self._on_any_changed)
@@ -325,42 +342,128 @@ class SettingsPanel(QWidget):
     # ------------------------------------------------------------------
     # Printer profiles
     # ------------------------------------------------------------------
-    def _load_printer_profiles(self):
-        profiles_dir = os.path.join(
+    def _get_profiles_dir(self) -> str:
+        d = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "profiles", "printers"
         )
-        self._profiles = {}
-        if os.path.isdir(profiles_dir):
-            for fn in glob.glob(os.path.join(profiles_dir, "*.json")):
-                try:
-                    with open(fn, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    name = data.get("name", os.path.splitext(os.path.basename(fn))[0])
-                    self._profiles[name] = data
-                    self._profile_combo.addItem(name)
-                except Exception:
-                    pass
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _load_printer_profiles(self):
+        profiles_dir = self._get_profiles_dir()
+        self._profiles: dict = {}
+        self._profile_paths: dict = {}
+        for fn in glob.glob(os.path.join(profiles_dir, "*.json")):
+            try:
+                with open(fn, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                name = (data.get("name")
+                        or data.get("machine", {}).get("profile_name")
+                        or os.path.splitext(os.path.basename(fn))[0])
+                self._profiles[name] = data
+                self._profile_paths[name] = fn
+                self._profile_combo.addItem(name)
+            except Exception:
+                pass
 
     def _on_profile_changed(self):
         name = self._profile_combo.currentText()
         if name == "Custom" or name not in self._profiles:
             return
-        p = self._profiles[name]
+        data = self._profiles[name]
         self._updating = True
-        if "bed_x" in p:
-            self._bed_x.setValue(float(p["bed_x"]))
-        if "bed_y" in p:
-            self._bed_y.setValue(float(p["bed_y"]))
-        if "firmware" in p:
-            idx = self._firmware_combo.findText(p["firmware"])
-            if idx >= 0:
-                self._firmware_combo.setCurrentIndex(idx)
-        if "origin" in p:
-            idx = 0 if p["origin"] == "left_bottom" else 1
-            self._origin_combo.setCurrentIndex(idx)
+        if "machine" in data:
+            # Full AppSettings format — load all except path placement
+            loaded = AppSettings.from_dict(data)
+            self.settings.machine = loaded.machine
+            self.settings.pen = loaded.pen
+            self.settings.speed = loaded.speed
+            self.settings.fill = loaded.fill
+            self.settings.gcode = loaded.gcode
+        else:
+            # Legacy minimal format
+            if "bed_x" in data:
+                self.settings.machine.bed_x = float(data["bed_x"])
+            if "bed_y" in data:
+                self.settings.machine.bed_y = float(data["bed_y"])
+            if "firmware" in data:
+                self.settings.machine.firmware = data["firmware"]
+            if "origin" in data:
+                self.settings.machine.origin = data["origin"]
         self._updating = False
+        self._refresh_from_settings()
         self._on_any_changed()
+
+    def _on_new_profile(self):
+        name, ok = QInputDialog.getText(self, "新しいプロファイル", "プロファイル名:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self._write_to_settings()
+        self.settings.machine.profile_name = name
+        profiles_dir = self._get_profiles_dir()
+        safe_name = re.sub(r'[^\w\-.]', '_', name)
+        filepath = os.path.join(profiles_dir, f"{safe_name}.json")
+        data = self.settings.to_dict()
+        data["name"] = name
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", f"プロファイルの保存に失敗しました:\n{e}")
+            return
+        self._profiles[name] = data
+        self._profile_paths[name] = filepath
+        # Add to combo if not already there
+        if self._profile_combo.findText(name) < 0:
+            self._profile_combo.addItem(name)
+        self._profile_combo.blockSignals(True)
+        self._profile_combo.setCurrentText(name)
+        self._profile_combo.blockSignals(False)
+
+    def _on_save_profile(self):
+        name = self._profile_combo.currentText()
+        if name == "Custom":
+            self._on_new_profile()
+            return
+        if name not in self._profiles:
+            return
+        self._write_to_settings()
+        self.settings.machine.profile_name = name
+        filepath = self._profile_paths.get(name)
+        if not filepath:
+            return
+        data = self.settings.to_dict()
+        data["name"] = name
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", f"プロファイルの保存に失敗しました:\n{e}")
+            return
+        self._profiles[name] = data
+
+    def _on_del_profile(self):
+        name = self._profile_combo.currentText()
+        if name == "Custom":
+            return
+        ret = QMessageBox.question(
+            self, "削除確認", f"プロファイル '{name}' を削除しますか?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        filepath = self._profile_paths.pop(name, None)
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+        self._profiles.pop(name, None)
+        idx = self._profile_combo.findText(name)
+        if idx >= 0:
+            self._profile_combo.removeItem(idx)
+        self._profile_combo.setCurrentText("Custom")
 
     # ------------------------------------------------------------------
     # Sync helpers
@@ -430,7 +533,7 @@ class SettingsPanel(QWidget):
         gc.pen_down_code = self._pen_down_code.toPlainText()
 
     def _refresh_from_settings(self):
-        """Load widget values from self.settings (called on startup)."""
+        """Load widget values from self.settings (called on startup or profile load)."""
         self._updating = True
         s = self.settings
         m = s.machine
