@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
+import numpy as np
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QKeySequence, QUndoStack, QUndoCommand
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QStatusBar, QFileDialog,
-    QMessageBox, QSplitter,
+    QMessageBox, QSplitter, QDoubleSpinBox, QFrame,
 )
 
 from src.models.settings import AppSettings
@@ -61,16 +63,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = AppSettings()
-        self._source_groups: List[PathGroup] = []   # raw imported groups
-        self._display_groups: List[PathGroup] = []  # after transform / fill / optimize
+        self._source_groups: List[PathGroup] = []
+        self._display_groups: List[PathGroup] = []
         self._source_file: str = ""
         self._overflow = False
         self._preview_mode = "2D"
+        self._applying_placement = False   # guard against signal loops
 
-        # Undo stack
         self._undo_stack = QUndoStack(self)
-
-        # Track previous placement for undo
         self._prev_placement = self._snapshot_placement()
 
         self.setWindowTitle("Penplot-Gcoder")
@@ -94,19 +94,19 @@ class MainWindow(QMainWindow):
         self._settings_panel.center_clicked.connect(self._on_center_clicked)
         root.addWidget(self._settings_panel)
 
-        # Centre + Right: preview + path list
+        # Centre + Right splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
 
-        # Centre: preview stack
         preview_container = QWidget()
         pcl = QVBoxLayout(preview_container)
         pcl.setContentsMargins(0, 0, 0, 0)
+        pcl.setSpacing(2)
 
-        # Toolbar above preview
+        # ── Top toolbar: 2D/3D + Animate ─────────────────────────────────────
         tb = QHBoxLayout()
-        self._btn_2d = QPushButton("2D")
-        self._btn_3d = QPushButton("3D")
+        self._btn_2d   = QPushButton("2D")
+        self._btn_3d   = QPushButton("3D")
         self._btn_anim = QPushButton("▶ Animate")
         self._btn_2d.setCheckable(True)
         self._btn_3d.setCheckable(True)
@@ -118,26 +118,83 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._btn_3d)
         tb.addWidget(self._btn_anim)
         tb.addStretch()
+
+        # Cursor coordinate display (top-right of toolbar)
+        self._coord_label = QLabel("X: --.-  Y: --.-")
+        self._coord_label.setStyleSheet("color: #aaaaaa; font-family: monospace;")
+        tb.addWidget(self._coord_label)
         pcl.addLayout(tb)
 
-        # 2D / 3D previews
+        # ── Absolute-coordinate / transform input bar ─────────────────────────
+        abs_bar = QHBoxLayout()
+        abs_bar.setSpacing(6)
+
+        def _dspin(lo, hi, dec=2, suffix=""):
+            w = QDoubleSpinBox()
+            w.setRange(lo, hi)
+            w.setDecimals(dec)
+            w.setSuffix(suffix)
+            w.setFixedWidth(90)
+            return w
+
+        abs_bar.addWidget(QLabel("X:"))
+        self._abs_x = _dspin(-9999, 9999, 2, " mm")
+        abs_bar.addWidget(self._abs_x)
+
+        abs_bar.addWidget(QLabel("Y:"))
+        self._abs_y = _dspin(-9999, 9999, 2, " mm")
+        abs_bar.addWidget(self._abs_y)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
+        abs_bar.addWidget(sep)
+
+        abs_bar.addWidget(QLabel("W:"))
+        self._abs_w = QLabel("--")
+        self._abs_w.setFixedWidth(70)
+        abs_bar.addWidget(self._abs_w)
+
+        abs_bar.addWidget(QLabel("H:"))
+        self._abs_h = QLabel("--")
+        self._abs_h.setFixedWidth(70)
+        abs_bar.addWidget(self._abs_h)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
+        abs_bar.addWidget(sep2)
+
+        abs_bar.addWidget(QLabel("Scale:"))
+        self._abs_scale = _dspin(0.1, 10000, 1, " %")
+        abs_bar.addWidget(self._abs_scale)
+
+        abs_bar.addStretch()
+        pcl.addLayout(abs_bar)
+
+        # Connect abs bar → settings (block reverse update during init)
+        self._abs_x.editingFinished.connect(self._on_abs_bar_changed)
+        self._abs_y.editingFinished.connect(self._on_abs_bar_changed)
+        self._abs_scale.editingFinished.connect(self._on_abs_bar_changed)
+
+        # ── Previews ─────────────────────────────────────────────────────────
         self._preview_2d = Preview2D(self.settings)
         self._preview_3d = Preview3D(self.settings)
         self._preview_3d.setVisible(False)
 
+        # Connect 2D preview signals
+        self._preview_2d.cursor_moved.connect(self._on_cursor_moved)
+        self._preview_2d.placement_changed.connect(self._on_preview_placement_changed)
+
         pcl.addWidget(self._preview_2d)
         pcl.addWidget(self._preview_3d)
 
-        # Status bar under preview (overflow + stats)
+        # Info bar
         self._info_bar = QLabel()
         self._info_bar.setStyleSheet("padding: 2px 6px;")
         pcl.addWidget(self._info_bar)
 
         # Bottom toolbar
         btn_row = QHBoxLayout()
-        self._open_btn = QPushButton("Open File...")
+        self._open_btn  = QPushButton("Open File...")
         self._gcode_btn = QPushButton("Generate G-code")
-        self._save_btn = QPushButton("Save G-code...")
+        self._save_btn  = QPushButton("Save G-code...")
         self._gcode_text: Optional[str] = None
 
         self._open_btn.clicked.connect(self._on_open)
@@ -165,10 +222,12 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
 
+        # Init abs bar
+        self._sync_abs_bar()
+
     def _build_menu(self):
         mb = self.menuBar()
 
-        # File
         file_menu = mb.addMenu("File")
         act_open = QAction("Open...", self)
         act_open.setShortcut(QKeySequence.StandardKey.Open)
@@ -194,7 +253,6 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
-        # Edit
         edit_menu = mb.addMenu("Edit")
         act_undo = self._undo_stack.createUndoAction(self, "Undo")
         act_undo.setShortcut(QKeySequence.StandardKey.Undo)
@@ -203,7 +261,6 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(act_undo)
         edit_menu.addAction(act_redo)
 
-        # View
         view_menu = mb.addMenu("View")
         act_2d = QAction("2D View", self)
         act_2d.triggered.connect(lambda: self._switch_preview("2D"))
@@ -212,13 +269,13 @@ class MainWindow(QMainWindow):
         view_menu.addAction(act_2d)
         view_menu.addAction(act_3d)
 
-        # Help
         help_menu = mb.addMenu("Help")
         act_about = QAction("About", self)
         act_about.triggered.connect(self._on_about)
         help_menu.addAction(act_about)
 
     # ------------------------------------------------------------------ slots
+
     def _switch_preview(self, mode: str):
         self._preview_mode = mode
         self._btn_2d.setChecked(mode == "2D")
@@ -231,6 +288,8 @@ class MainWindow(QMainWindow):
             self._preview_2d.start_animation()
         else:
             self._preview_3d.start_animation()
+
+    # ── File loading ─────────────────────────────────────────────────────────
 
     def _on_open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -263,13 +322,54 @@ class MainWindow(QMainWindow):
 
         self._source_file = path
         self._source_groups = groups
-        # Populate path list with source groups so user can reorder them
         self._path_list.set_groups(list(groups))
         self.setWindowTitle(f"Penplot-Gcoder — {os.path.basename(path)}")
+
+        # Auto-fit: scale and center to effective drawing area
+        self._auto_fit_to_bed(groups)
         self._refresh_display()
 
+    def _auto_fit_to_bed(self, groups: List[PathGroup]):
+        """Scale + center raw paths to 90 % of effective drawing area."""
+        all_pts = []
+        for g in groups:
+            for p in g.paths:
+                all_pts.extend(p.points)
+        if not all_pts:
+            return
+
+        pts = np.array(all_pts)
+        src_w = float(pts[:, 0].max() - pts[:, 0].min())
+        src_h = float(pts[:, 1].max() - pts[:, 1].min())
+        if src_w <= 0 and src_h <= 0:
+            return
+
+        x_min, y_min, x_max, y_max = self.settings.effective_area()
+        eff_w = x_max - x_min
+        eff_h = y_max - y_min
+
+        # Compute scale to fit within 90 % of effective area
+        scale_x = (eff_w / src_w * 0.9) if src_w > 0 else 1.0
+        scale_y = (eff_h / src_h * 0.9) if src_h > 0 else 1.0
+        fit_scale = min(scale_x, scale_y) * 100.0   # as percent
+
+        # Compute offset so the path center lands on the area center
+        src_cx = float((pts[:, 0].min() + pts[:, 0].max()) / 2)
+        src_cy = float((pts[:, 1].min() + pts[:, 1].max()) / 2)
+        tgt_cx = (x_min + x_max) / 2
+        tgt_cy = (y_min + y_max) / 2
+
+        self.settings.path.scale    = fit_scale
+        self.settings.path.offset_x = tgt_cx - src_cx * fit_scale / 100.0
+        self.settings.path.offset_y = tgt_cy - src_cy * fit_scale / 100.0
+        self.settings.path.rotation = 0.0
+        self._prev_placement = self._snapshot_placement()
+        self._settings_panel._refresh_from_settings()
+        self._sync_abs_bar()
+
+    # ── Display refresh ──────────────────────────────────────────────────────
+
     def _refresh_display(self):
-        """Apply transforms, fill, optimize to source groups and update previews."""
         if not self._source_groups:
             self._display_groups = []
             self._overflow = False
@@ -279,11 +379,9 @@ class MainWindow(QMainWindow):
 
         pa = self.settings.path
         fi = self.settings.fill
+        ordered_source = (self._path_list.current_groups()
+                          if self._path_list.groups else self._source_groups)
 
-        # Use path list order (which tracks source groups in user-reordered order)
-        ordered_source = self._path_list.current_groups() if self._path_list.groups else self._source_groups
-
-        # Transform all source paths
         all_transformed: List[PathGroup] = []
         for group in ordered_source:
             new_paths = []
@@ -296,10 +394,8 @@ class MainWindow(QMainWindow):
                 )
                 new_paths.append(tp)
 
-            # Fill generation
             fill_paths = generate_fills_for_paths(new_paths, fi) if fi.enabled else []
 
-            # Determine layering
             if fi.layer_order == "outline_first":
                 combined = new_paths + fill_paths
             elif fi.layer_order == "fill_first":
@@ -307,28 +403,25 @@ class MainWindow(QMainWindow):
             else:
                 combined = fill_paths
 
-            # Optimization
             if pa.optimize and combined:
                 combined = optimize(combined, pa.optimize_algorithm, pa.join_distance)
 
             from src.models.pen_path import PathGroup as PG
-            new_group = PG(
+            all_transformed.append(PG(
                 color=group.color,
                 label=group.label,
                 paths=combined,
                 pen_change_before=group.pen_change_before,
-            )
-            all_transformed.append(new_group)
+            ))
 
         self._display_groups = all_transformed
-
-        # Check overflow
         all_paths = [p for g in self._display_groups for p in g.paths]
         self._overflow = paths_overflow(all_paths, self.settings)
 
         self._update_preview()
         self._update_status()
         self._gcode_btn.setEnabled(not self._overflow)
+        self._sync_abs_bar()
 
     def _update_preview(self):
         self._preview_2d.set_groups(self._display_groups)
@@ -343,84 +436,145 @@ class MainWindow(QMainWindow):
             dummy_groups = [PathGroup(paths=all_paths)]
             total_mm, est_sec = _estimate_time(dummy_groups, self.settings)
             m, s = divmod(int(est_sec), 60)
-            time_str = f"{m}m{s:02d}s"
+            time_str  = f"{m}m{s:02d}s"
             total_str = f"{total_mm:.0f}mm"
         else:
-            time_str = "0m00s"
-            total_str = "0mm"
+            time_str = total_str = "—"
 
         eff = self.settings.effective_area()
         w = eff[2] - eff[0]
         h = eff[3] - eff[1]
-        info = f"Effective area: {w:.1f}×{h:.1f}mm  |  Paths: {n}  |  Est. time: {time_str}  |  Draw: {total_str}"
+        info = (f"Effective area: {w:.1f}×{h:.1f}mm  |  "
+                f"Paths: {n}  |  Est. time: {time_str}  |  Draw: {total_str}")
         if self._overflow:
             info += "  ⚠ OVERFLOW"
         self._info_bar.setText(info)
         self._status.showMessage(info)
 
+    # ── Absolute-coordinate bar ───────────────────────────────────────────────
+
+    def _sync_abs_bar(self):
+        """Update the absolute-coordinate bar from current settings + bbox."""
+        if self._applying_placement:
+            return
+        pa = self.settings.path
+        self._abs_x.blockSignals(True)
+        self._abs_y.blockSignals(True)
+        self._abs_scale.blockSignals(True)
+
+        self._abs_x.setValue(pa.offset_x)
+        self._abs_y.setValue(pa.offset_y)
+        self._abs_scale.setValue(pa.scale)
+
+        # Compute W / H from display bbox
+        bbox = self._preview_2d._compute_bbox()
+        if bbox:
+            x0, y0, x1, y1 = bbox
+            self._abs_w.setText(f"{x1 - x0:.2f} mm")
+            self._abs_h.setText(f"{y1 - y0:.2f} mm")
+        else:
+            self._abs_w.setText("--")
+            self._abs_h.setText("--")
+
+        self._abs_x.blockSignals(False)
+        self._abs_y.blockSignals(False)
+        self._abs_scale.blockSignals(False)
+
+    def _on_abs_bar_changed(self):
+        """User typed an exact value in the abs bar."""
+        if self._applying_placement:
+            return
+        old = self._snapshot_placement()
+        self.settings.path.offset_x = self._abs_x.value()
+        self.settings.path.offset_y = self._abs_y.value()
+        self.settings.path.scale    = self._abs_scale.value()
+        new = self._snapshot_placement()
+        if new != old:
+            self._push_placement_undo(old, new)
+        self._settings_panel._refresh_from_settings()
+        self._refresh_display()
+
+    # ── Preview signals ───────────────────────────────────────────────────────
+
+    def _on_cursor_moved(self, x: float, y: float):
+        self._coord_label.setText(f"X: {x:7.2f}  Y: {y:7.2f} mm")
+
+    def _on_preview_placement_changed(self, ox: float, oy: float, scale: float):
+        """Live drag update from the 2D preview."""
+        if self._applying_placement:
+            return
+        self._applying_placement = True
+        old = self._snapshot_placement()
+        self.settings.path.offset_x = ox
+        self.settings.path.offset_y = oy
+        self.settings.path.scale    = scale
+        self._applying_placement = False
+
+        self._settings_panel._refresh_from_settings()
+        self._refresh_display()
+        new = self._snapshot_placement()
+        if new != old:
+            self._push_placement_undo(old, new)
+
+    # ── Settings-panel change ─────────────────────────────────────────────────
+
     def _on_settings_changed(self):
-        """Called whenever settings panel emits settings_changed."""
+        if self._applying_placement:
+            return
         new_placement = self._snapshot_placement()
-        if new_placement != self._prev_placement and not self._undo_stack.isActive():
+        if new_placement != self._prev_placement:
             old = self._prev_placement
             self._prev_placement = new_placement
-            cmd = PlacementCommand(
-                self,
-                old[0], old[1], old[2], old[3],
-                new_placement[0], new_placement[1], new_placement[2], new_placement[3],
-            )
-            # Push without triggering redo (which would recurse)
-            self._undo_stack.blockSignals(True)
-            self._undo_stack.push(cmd)
-            self._undo_stack.blockSignals(False)
+            self._push_placement_undo(old, new_placement)
         self._refresh_display()
+
+    def _push_placement_undo(self, old, new):
+        self._prev_placement = new
+        cmd = PlacementCommand(self, old[0], old[1], old[2], old[3],
+                               new[0], new[1], new[2], new[3])
+        self._undo_stack.blockSignals(True)
+        self._undo_stack.push(cmd)
+        self._undo_stack.blockSignals(False)
 
     def _snapshot_placement(self):
         pa = self.settings.path
         return (pa.scale, pa.offset_x, pa.offset_y, pa.rotation)
 
     def _on_center_clicked(self):
-        """Center the drawing on the effective drawing area."""
         if not self._display_groups:
             return
         all_paths = [p for g in self._display_groups for p in g.paths]
         if not all_paths:
             return
 
-        import numpy as np
         pts_list = [p.np_points for p in all_paths if len(p.np_points) > 0]
         if not pts_list:
             return
-        all_pts = np.concatenate(pts_list)
-        bmin = all_pts.min(axis=0)
-        bmax = all_pts.max(axis=0)
-        draw_cx = (bmin[0] + bmax[0]) / 2
-        draw_cy = (bmin[1] + bmax[1]) / 2
+        all_pts  = np.concatenate(pts_list)
+        draw_cx  = float((all_pts[:, 0].min() + all_pts[:, 0].max()) / 2)
+        draw_cy  = float((all_pts[:, 1].min() + all_pts[:, 1].max()) / 2)
 
         x_min, y_min, x_max, y_max = self.settings.effective_area()
         area_cx = (x_min + x_max) / 2
         area_cy = (y_min + y_max) / 2
 
-        pa = self.settings.path
-        old_placement = self._snapshot_placement()
-        pa.offset_x += area_cx - draw_cx
-        pa.offset_y += area_cy - draw_cy
-
-        new_placement = self._snapshot_placement()
-        self._prev_placement = new_placement
-        cmd = PlacementCommand(self, *old_placement, *new_placement)
-        self._undo_stack.blockSignals(True)
-        self._undo_stack.push(cmd)
-        self._undo_stack.blockSignals(False)
+        old = self._snapshot_placement()
+        self.settings.path.offset_x += area_cx - draw_cx
+        self.settings.path.offset_y += area_cy - draw_cy
+        new = self._snapshot_placement()
+        self._push_placement_undo(old, new)
         self._settings_panel._refresh_from_settings()
         self._refresh_display()
 
     def _on_path_order_changed(self):
         self._refresh_display()
 
+    # ── G-code ───────────────────────────────────────────────────────────────
+
     def _on_generate_gcode(self):
         if self._overflow:
-            QMessageBox.warning(self, "Overflow", "Path overflows effective area. Cannot generate G-code.")
+            QMessageBox.warning(self, "Overflow",
+                                "Path overflows effective area. Cannot generate G-code.")
             return
         src = os.path.basename(self._source_file) if self._source_file else ""
         try:
@@ -429,18 +583,22 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"G-code generation failed:\n{e}")
             return
         self._save_btn.setEnabled(True)
-        QMessageBox.information(self, "G-code ready",
-                                f"G-code generated successfully ({len(self._gcode_text)} chars).\n"
-                                "Click 'Save G-code...' to save.")
+        QMessageBox.information(
+            self, "G-code ready",
+            f"G-code generated ({len(self._gcode_text)} chars).\n"
+            "Click 'Save G-code...' to save."
+        )
 
     def _on_save_gcode(self):
         if not self._gcode_text:
             self._on_generate_gcode()
         if not self._gcode_text:
             return
-        default = os.path.splitext(self._source_file)[0] + ".gcode" if self._source_file else "output.gcode"
+        default = (os.path.splitext(self._source_file)[0] + ".gcode"
+                   if self._source_file else "output.gcode")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save G-code", default, "G-code Files (*.gcode *.nc *.txt);;All Files (*)"
+            self, "Save G-code", default,
+            "G-code Files (*.gcode *.nc *.txt);;All Files (*)"
         )
         if not path:
             return
@@ -450,16 +608,14 @@ class MainWindow(QMainWindow):
 
     def _on_save_settings(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Settings", "", "JSON Files (*.json);;All Files (*)"
-        )
+            self, "Save Settings", "", "JSON Files (*.json);;All Files (*)")
         if path:
             self.settings.to_json(path)
             self._status.showMessage(f"Settings saved: {path}")
 
     def _on_load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Settings", "", "JSON Files (*.json);;All Files (*)"
-        )
+            self, "Load Settings", "", "JSON Files (*.json);;All Files (*)")
         if path:
             try:
                 self.settings = AppSettings.from_json(path)
