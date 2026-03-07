@@ -1,0 +1,56 @@
+{
+  "machine": {
+    "profile_name": "K9",
+    "firmware": "Marlin",
+    "bed_x": 100.0,
+    "bed_y": 100.0,
+    "origin": "left_bottom"
+  },
+  "pen": {
+    "pen_down_z": 0.0,
+    "pen_up_z": 0.0,
+    "pen_down_speed": 1.0,
+    "pen_up_speed": 1.0,
+    "touchdown_delay": 0,
+    "liftup_delay": 0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "offset_z": 0.0
+  },
+  "speed": {
+    "draw_speed": 1.0,
+    "travel_speed": 1.0,
+    "acceleration": 1.0,
+    "corner_speed": 0.0
+  },
+  "path": {
+    "scale": 0.1,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "rotation": 0.0,
+    "optimize": false,
+    "optimize_algorithm": "Greedy",
+    "join_distance": 0.0,
+    "curve_precision": 0.01
+  },
+  "fill": {
+    "enabled": false,
+    "target": "fill_color",
+    "layer_order": "outline_first",
+    "pattern": "Lines",
+    "spacing": 0.01,
+    "angle": 0.0,
+    "margin": 0.0,
+    "cross_hatch_angle2": 0.0,
+    "contour_innermost": "keep",
+    "dots_grid": "grid",
+    "dots_spacing_y": 0.01
+  },
+  "gcode": {
+    "start_code": "",
+    "end_code": "",
+    "pen_up_code": "",
+    "pen_down_code": ""
+  },
+  "name": "K9"
+}

@@ -441,6 +441,10 @@ opencv-python>=4.8.0
 | 実装 | 設定自動保存 (autosave.json / デバウンス1秒) | 完了 |
 | 実装 | プロファイル追加・保存・削除 (全設定対応) | 完了 |
 | 実装 | .gitignore 作成 | 完了 |
+| 実装 | Raw ビュー GIMP 風キャンバス (src/ui/raw_view.py) | 完了 |
+| 実装 | 配置コントロール (Scale/X/Y/R/中央) を Raw タブ限定に変更 | 完了 |
+| 実装 | Raw 画像モードにベッドサイズ・有効エリアオーバーレイ追加 | 完了 |
+| 実装 | レイヤー管理 (ファイル単位・表示/非表示・並び替え) | 完了 |
 
 ---
 
@@ -454,6 +458,8 @@ opencv-python>=4.8.0
 | 2026-03-06 | v4 | 3Dプレビューライブラリをpyqtgraphに確定。2DプレビューをQPainterに確定。PNG/JPG処理をcv2に確定。プロジェクトファイル構成追加。SVG複数色グループ対応追加。Undo/Redo (QUndoStack) 追加。requirements.txt確定。 | ユーザー承認・実装開始前の仕様確定 |
 | 2026-03-06 | v5 | 全機能を実装完了。main.py / src/ ディレクトリ全体 / profiles/ を新規作成。models (settings.py, pen_path.py)、core (bed_calculator, path_optimizer, fill_generator, gcode_generator, importers)、ui (main_window, settings_panel, preview_2d, preview_3d, path_list) を実装。 | 実装完了 |
 | 2026-03-07 | v6 | main.py に自動パッケージインストール機能追加 (_check_and_install)。setup.bat 作成 (pip install + python main.py を一括実行)。 | 初回セットアップの簡略化 |
-| 2026-03-07 | v9 | シークバー追加 (▶/⏸ ボタン + QSlider でパス再生)。Raw ビュー修正 (スケールのみ適用した座標で表示)。複数ファイル同時インポート対応 (getOpenFileNames)。設定自動保存機能追加 (profiles/user/autosave.json に1秒デバウンス保存、起動時自動復元)。プロファイル管理強化 (New/Save/Delete ボタン追加、全 AppSettings を JSON 保存/読み込み、path placement は保持)。.gitignore 作成 (profiles/user/ を除外)。 | ユーザー要件追加 |
+| 2026-03-07 | v9 | シークバー追加 (▶/⏸ ボタン + QSlider でパス再生)。複数ファイル同時インポート対応 (getOpenFileNames)。設定自動保存機能追加 (profiles/user/autosave.json に1秒デバウンス保存、起動時自動復元)。プロファイル管理強化 (New/Save/Delete ボタン追加、全 AppSettings を JSON 保存/読み込み、path placement は保持)。.gitignore 作成 (profiles/user/ を除外)。 | ユーザー要件追加 |
+| 2026-03-07 | v10 | Raw ビューを GIMP 風 QGraphicsView キャンバスに全面リニューアル (src/ui/raw_view.py 新規作成)。画像: 元画像+チェッカーボード+輪郭オーバーレイ、抽出パラメーターをリアルタイム変更可能。ベクター: 元座標でパスを表示、クリック選択・Delete 削除。ホイールズーム/ドラッグパン対応。画像ベクター変換は Generate ボタン押下時に遅延実行。Generate ボタンが押せる状態なら点滅 (パルスアニメーション)。設定変更で Preview データ破棄・Generate 待機。Generate 完了で自動的に Preview タブへ移行。Raw ではベクターは Preview2D でドラッグ配置可能。"変換後" タブ名を "Preview" に変更。 | ユーザー要件 |
 | 2026-03-07 | v7 | UI をタブベース5ステップフロー (① 配置 / ② 設定 / ③ 生成 / ④ 確認 / ⑤ 出力) に再構築。ファイルパス問題 (日本語・記号・長パス) を一時コピーで修正 (_safe_filepath)。自動フィット・カーソル座標・ドラッグ操作は配置タブに統合。 | ユーザー要件追加 |
 | 2026-03-07 | v8 | UIをChituboxライクな1画面構成に全面再設計。左=設定パネル/中央=プレビュー(Raw 2D・変換後 2D・3D切り替え)/右=パスリスト+統計/下部バー=配置コントロール+アクションボタン。ファイル読み込み時にRaw→変換後を自動切り替えで両方確認できる。 | ユーザー要件変更 |
+| 2026-03-07 | v11 | 配置コントロール (Scale/X/Y/R/中央/ドラッグ) を Raw タブ限定に変更 (Preview・3D タブでは無効化)。Raw 画像モードに mm 単位ベッド境界・有効エリアオーバーレイを追加 (設定変更でリアルタイム更新)。_source_groups+_source_files を _layers 構造 [{name,filepath,groups,visible}] に置き換え。PathListPanel をレイヤー対応に全面改修 (ファイル単位レイヤーヘッダー・表示/非表示チェックボックス・グループ並び替え)。 | ユーザー要件: Raw でのみ配置操作・ベッドサイズ表示・レイヤー管理 |
