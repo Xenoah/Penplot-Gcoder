@@ -1,7 +1,7 @@
 {
   "machine": {
     "profile_name": "K9",
-    "firmware": "Marlin",
+    "firmware": "Klipper",
     "bed_x": 100.0,
     "bed_y": 100.0,
     "origin": "left_bottom"
@@ -24,9 +24,9 @@
     "corner_speed": 0.0
   },
   "path": {
-    "scale": 0.9,
-    "offset_x": 0.6,
-    "offset_y": 0.6,
+    "scale": 9.0,
+    "offset_x": 3.86,
+    "offset_y": 3.08,
     "rotation": 0.0,
     "optimize": false,
     "optimize_algorithm": "Greedy",
