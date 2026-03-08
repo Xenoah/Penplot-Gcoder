@@ -24,6 +24,7 @@ from src.ui.preview_2d import Preview2D
 from src.ui.preview_3d import Preview3D
 from src.ui.raw_view import RawView
 from src.ui.path_list import PathListPanel
+from src.ui.raw_toolbar import RawToolbar
 from src.core.bed_calculator import paths_overflow
 from src.core.path_optimizer import optimize
 from src.core.fill_generator import generate_fills_for_paths
@@ -129,15 +130,22 @@ class MainWindow(QMainWindow):
         self._raw_view       = RawView(self.settings)
         self._path_list      = PathListPanel()
         self._settings_panel = SettingsPanel(self.settings)
+        self._raw_toolbar    = RawToolbar()
 
         self._preview_2d.cursor_moved.connect(self._on_cursor_moved)
         self._preview_2d.placement_changed.connect(self._on_preview_placement)
+        self._preview_2d.path_drawn.connect(self._on_path_drawn)
         self._settings_panel.settings_changed.connect(self._on_settings_changed)
         self._settings_panel.center_clicked.connect(self._on_center_clicked)
         self._path_list.order_changed.connect(self._on_path_order_changed)
         self._path_list.pen_change_changed.connect(self._on_path_order_changed)
-        self._raw_view.groups_changed.connect(self._on_raw_groups_changed)
         self._path_list.layer_visibility_changed.connect(self._on_layer_visibility_changed)
+        self._path_list.add_layer_requested.connect(self._on_add_draw_layer)
+        self._path_list.delete_layer_requested.connect(self._on_delete_layer)
+        self._raw_view.groups_changed.connect(self._on_raw_groups_changed)
+        self._raw_toolbar.tool_changed.connect(self._on_tool_changed)
+        self._raw_toolbar.color_changed.connect(self._preview_2d.set_draw_color)
+        self._raw_toolbar.width_changed.connect(self._preview_2d.set_draw_width_mm)
 
         # ── Timers ────────────────────────────────────────────────────────
         self._play_timer = QTimer(self)
@@ -221,6 +229,9 @@ class MainWindow(QMainWindow):
             "font-family: monospace; color: #aaa; font-size: 11px;")
         ptb.addWidget(self._coord_lbl)
         cvl.addLayout(ptb)
+
+        # Raw drawing toolbar (only visible in Raw tab)
+        cvl.addWidget(self._raw_toolbar)
 
         # Canvas stack  (Raw image | Preview2D | Preview3D)
         self._raw_view.setVisible(True)
@@ -386,9 +397,10 @@ class MainWindow(QMainWindow):
         self._seekbar.setEnabled(can_anim)
         self._btn_play.setEnabled(can_anim)
 
-        # Placement controls only active in Raw tab
+        # Placement controls + drawing toolbar only active in Raw tab
         for w in self._placement_widgets:
             w.setEnabled(mode == "raw")
+        self._raw_toolbar.setVisible(mode == "raw")
 
         self._push_to_preview()
 
@@ -779,6 +791,65 @@ class MainWindow(QMainWindow):
         if self._view_mode == "raw" and not self._is_image_mode():
             self._preview_2d.set_groups(self._raw_placed_groups())
         self._mark_preview_dirty()
+
+    def _on_tool_changed(self, tool: str):
+        """Raw toolbar tool selection."""
+        self._preview_2d.set_active_tool(tool)
+
+    def _on_path_drawn(self, pen_path):
+        """User drew a stroke in Preview2D — add it to the active draw layer."""
+        from src.models.pen_path import PathGroup as PG
+        idx = self._path_list.active_layer_index()
+        # Find or create a draw layer
+        draw_layer = None
+        if 0 <= idx < len(self._layers) and self._layers[idx].get('is_draw', False):
+            draw_layer = self._layers[idx]
+        else:
+            # Look for any existing draw layer
+            for l in self._layers:
+                if l.get('is_draw', False):
+                    draw_layer = l
+                    break
+        if draw_layer is None:
+            # Create a new draw layer
+            draw_layer = {'name': '描画レイヤー', 'filepath': '',
+                          'groups': [], 'visible': True, 'is_draw': True}
+            self._layers.append(draw_layer)
+            new_idx = len(self._layers) - 1
+            self._path_list.set_layers(self._layers)
+            self._path_list.set_active_layer(new_idx)
+        # Add the path as a new group (or extend existing draw group with same color)
+        target_grp = None
+        for g in draw_layer['groups']:
+            if g.color == pen_path.color:
+                target_grp = g
+                break
+        if target_grp is None:
+            target_grp = PG(color=pen_path.color, label=f"Draw ({pen_path.color})")
+            draw_layer['groups'].append(target_grp)
+        target_grp.paths.append(pen_path)
+        self._path_list.set_layers(self._layers)
+        self._mark_preview_dirty()
+
+    def _on_add_draw_layer(self):
+        """Add a new empty draw layer."""
+        n = sum(1 for l in self._layers if l.get('is_draw', False)) + 1
+        new_layer = {'name': f'描画レイヤー {n}', 'filepath': '',
+                     'groups': [], 'visible': True, 'is_draw': True}
+        self._layers.append(new_layer)
+        new_idx = len(self._layers) - 1
+        self._path_list.set_layers(self._layers)
+        self._path_list.set_active_layer(new_idx)
+
+    def _on_delete_layer(self, idx: int):
+        """Delete a draw layer."""
+        if 0 <= idx < len(self._layers) and self._layers[idx].get('is_draw', False):
+            self._layers.pop(idx)
+            new_active = max(0, idx - 1)
+            self._path_list.set_layers(self._layers)
+            if self._layers:
+                self._path_list.set_active_layer(new_active)
+            self._mark_preview_dirty()
 
     # ═══════════════════════════════════════════════════ Generate
 

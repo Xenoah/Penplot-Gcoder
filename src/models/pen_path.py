@@ -14,6 +14,7 @@ class PenPath:
     is_closed: bool = False
     layer: str = "default"
     source_id: str = ""             # original SVG id / DXF handle
+    stroke_width_mm: float = 0.5   # visual stroke width in mm (for preview/user-drawn paths)
 
     # ---- derived / cached ------------------------------------------------
     @property
@@ -48,6 +49,7 @@ class PenPath:
             is_closed=self.is_closed,
             layer=self.layer,
             source_id=self.source_id,
+            stroke_width_mm=self.stroke_width_mm,
         )
 
     def transformed(self, scale: float = 1.0,
@@ -74,6 +76,7 @@ class PenPath:
             is_closed=self.is_closed,
             layer=self.layer,
             source_id=self.source_id,
+            stroke_width_mm=self.stroke_width_mm,
         )
 
 
