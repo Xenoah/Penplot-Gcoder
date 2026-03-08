@@ -201,8 +201,8 @@ class MainWindow(QMainWindow):
         ptb = QHBoxLayout()
 
         self._btn_raw   = QPushButton("Raw")
-        self._btn_trans = QPushButton("Preview")
-        self._btn_3d    = QPushButton("3D")
+        self._btn_trans = QPushButton("Preview 2D")
+        self._btn_3d    = QPushButton("Preview 3D")
         for b in (self._btn_raw, self._btn_trans, self._btn_3d):
             b.setCheckable(True)
             b.setFixedHeight(26)

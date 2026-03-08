@@ -537,6 +537,15 @@ class SettingsPanel(QWidget):
         self._updating = True
         s = self.settings
         m = s.machine
+
+        # Restore profile combo selection without triggering _on_profile_changed
+        if m.profile_name:
+            idx = self._profile_combo.findText(m.profile_name)
+            if idx >= 0:
+                self._profile_combo.blockSignals(True)
+                self._profile_combo.setCurrentIndex(idx)
+                self._profile_combo.blockSignals(False)
+
         fw_idx = self._firmware_combo.findText(m.firmware)
         if fw_idx >= 0:
             self._firmware_combo.setCurrentIndex(fw_idx)
