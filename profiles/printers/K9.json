@@ -8,7 +8,7 @@
   },
   "pen": {
     "pen_down_z": 0.0,
-    "pen_up_z": 0.0,
+    "pen_up_z": 5.0,
     "pen_down_speed": 1.0,
     "pen_up_speed": 1.0,
     "touchdown_delay": 0,
@@ -24,9 +24,9 @@
     "corner_speed": 0.0
   },
   "path": {
-    "scale": 0.1,
-    "offset_x": 0.0,
-    "offset_y": 0.0,
+    "scale": 8.8,
+    "offset_x": 5.0,
+    "offset_y": 4.91,
     "rotation": 0.0,
     "optimize": false,
     "optimize_algorithm": "Greedy",

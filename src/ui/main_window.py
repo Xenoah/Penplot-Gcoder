@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self._gcode_text: Optional[str] = None
         self._applying        = False
         self._view_mode       = "raw"   # "raw" | "transformed" | "3d"
+        self._raw_show_params = False   # True = show GIMP extraction params panel
 
         self._undo_stack = QUndoStack(self)
         self._prev_snap  = self._snap()
@@ -146,6 +147,7 @@ class MainWindow(QMainWindow):
         self._raw_toolbar.tool_changed.connect(self._on_tool_changed)
         self._raw_toolbar.color_changed.connect(self._preview_2d.set_draw_color)
         self._raw_toolbar.width_changed.connect(self._preview_2d.set_draw_width_mm)
+        self._raw_toolbar.img_params_toggled.connect(self._on_img_params_toggled)
 
         # ── Timers ────────────────────────────────────────────────────────
         self._play_timer = QTimer(self)
@@ -290,24 +292,29 @@ class MainWindow(QMainWindow):
         self._file_lbl.setStyleSheet("color:#888; font-size:11px;")
         self._file_lbl.setMaximumWidth(220)
         hl.addWidget(self._file_lbl)
-        hl.addWidget(_sep())
+        self._sep_placement = _sep()
+        hl.addWidget(self._sep_placement)
 
-        hl.addWidget(QLabel("Scale:"))
+        lbl_scale = QLabel("Scale:")
+        lbl_x     = QLabel("X:")
+        lbl_y     = QLabel("Y:")
+        lbl_r     = QLabel("R:")
+        hl.addWidget(lbl_scale)
         self._bot_scale = _dspin(0.1, 10000, 1, 1.0, " %")
         self._bot_scale.setFixedWidth(80)
         hl.addWidget(self._bot_scale)
 
-        hl.addWidget(QLabel("X:"))
+        hl.addWidget(lbl_x)
         self._bot_x = _dspin(-9999, 9999, 2, 0.5, " mm")
         self._bot_x.setFixedWidth(90)
         hl.addWidget(self._bot_x)
 
-        hl.addWidget(QLabel("Y:"))
+        hl.addWidget(lbl_y)
         self._bot_y = _dspin(-9999, 9999, 2, 0.5, " mm")
         self._bot_y.setFixedWidth(90)
         hl.addWidget(self._bot_y)
 
-        hl.addWidget(QLabel("R:"))
+        hl.addWidget(lbl_r)
         self._bot_rot = _dspin(-360, 360, 1, 1.0, "°")
         self._bot_rot.setFixedWidth(75)
         hl.addWidget(self._bot_rot)
@@ -316,15 +323,18 @@ class MainWindow(QMainWindow):
         self._btn_center.setFixedHeight(28)
         self._btn_center.clicked.connect(self._on_center_clicked)
         hl.addWidget(self._btn_center)
-        hl.addWidget(_sep())
 
         self._bot_wh = QLabel("W: --  H: --")
         self._bot_wh.setStyleSheet(
             "color:#aaa; font-size:11px; font-family:monospace;")
         hl.addWidget(self._bot_wh)
+
+        self._sep_placement2 = _sep()
+        hl.addWidget(self._sep_placement2)
+
         hl.addStretch()
 
-        self._btn_gen  = QPushButton("⚙ G-code 生成")
+        self._btn_gen  = QPushButton("⚙ Generate")
         self._btn_save = QPushButton("💾 保存")
         self._btn_copy = QPushButton("📋 コピー")
         for b in (self._btn_gen, self._btn_save, self._btn_copy):
@@ -338,7 +348,11 @@ class MainWindow(QMainWindow):
 
         self._placement_widgets = [
             self._bot_scale, self._bot_x, self._bot_y,
-            self._bot_rot, self._btn_center,
+            self._bot_rot, self._btn_center, self._bot_wh,
+        ]
+        self._placement_labels = [
+            lbl_scale, lbl_x, lbl_y, lbl_r,
+            self._sep_placement, self._sep_placement2,
         ]
 
         for sp in (self._bot_scale, self._bot_x, self._bot_y, self._bot_rot):
@@ -378,8 +392,8 @@ class MainWindow(QMainWindow):
         return [g for l in self._layers if l.get('visible', True) for g in l['groups']]
 
     def _is_image_mode(self) -> bool:
-        """True when the loaded file is a single raster image (GIMP canvas mode)."""
-        return bool(self._raw_image_path and len(self._layers) == 1)
+        """True when a raster image is loaded (regardless of additional draw layers)."""
+        return bool(self._raw_image_path)
 
     def _set_view(self, mode: str):
         self._view_mode = mode
@@ -387,54 +401,92 @@ class MainWindow(QMainWindow):
         self._btn_trans.setChecked(mode == "transformed")
         self._btn_3d.setChecked(mode == "3d")
 
-        in_raw_image = mode == "raw" and self._is_image_mode()
-        self._raw_view.setVisible(in_raw_image)
-        self._preview_2d.setVisible(not in_raw_image and mode != "3d")
+        is_raw = (mode == "raw")
+        is_img = self._is_image_mode()
+        # Raw image mode: GIMP canvas shown only when params panel toggled on
+        show_raw_view = is_raw and is_img and self._raw_show_params
+        # Preview2D shown in: raw-vector, raw-image-placement, transformed
+        show_2d = (mode != "3d") and not show_raw_view
+        self._raw_view.setVisible(show_raw_view)
+        self._preview_2d.setVisible(show_2d)
         self._preview_3d.setVisible(mode == "3d")
 
+        # Toolbar visibility and image-mode button
+        self._raw_toolbar.setVisible(is_raw)
+        self._raw_toolbar.set_image_mode(is_raw and is_img)
+
+        # Preview2D interactive only in Raw tab
+        self._preview_2d.set_interactive(is_raw)
+
         # Seekbar / play only relevant in Preview / 3D modes
-        can_anim = mode != "raw"
+        can_anim = not is_raw
         self._seekbar.setEnabled(can_anim)
         self._btn_play.setEnabled(can_anim)
 
-        # Placement controls + drawing toolbar only active in Raw tab
+        # Placement controls only visible in Raw tab
         for w in self._placement_widgets:
-            w.setEnabled(mode == "raw")
-        self._raw_toolbar.setVisible(mode == "raw")
+            w.setVisible(is_raw)
+        # Labels next to placement controls
+        for w in self._placement_labels:
+            w.setVisible(is_raw)
 
         self._push_to_preview()
 
     def _push_to_preview(self):
         """Feed data to the visible canvas."""
-        mode = self._view_mode
+        mode    = self._view_mode
+        is_img  = self._is_image_mode()
+
         if mode == "raw":
             if not self._active_source_groups() and not self._raw_image_path:
+                self._preview_2d.set_groups([])
+                self._preview_2d.set_background_image(None)
                 self._raw_view.clear()
-            elif self._is_image_mode():
-                # GIMP canvas for images
-                if self._raw_view_dirty:
-                    self._raw_view.set_image_file(self._raw_image_path, [])
-                    self._raw_view_dirty = False
+            elif is_img:
+                if self._raw_show_params:
+                    # GIMP canvas for extraction parameter editing
+                    if self._raw_view_dirty:
+                        self._raw_view.set_image_file(self._raw_image_path, [])
+                        self._raw_view_dirty = False
+                else:
+                    # Placement view: Preview2D with background image
+                    self._preview_2d.set_background_image(self._raw_image_path)
+                    # Show draw layer paths on top of the image
+                    draw_groups = [g for l in self._layers
+                                   if l.get('is_draw', False) and l.get('visible', True)
+                                   for g in l['groups']]
+                    self._preview_2d.set_groups(draw_groups)
+                    self._preview_2d.set_overflow(False)
             else:
-                # Vector raw: show source data with current placement in Preview2D
+                # Vector raw: show source data with placement transform applied
+                self._preview_2d.set_background_image(None)
                 self._preview_2d.set_groups(self._raw_placed_groups())
                 self._preview_2d.set_overflow(False)
         elif mode == "transformed":
+            self._preview_2d.set_background_image(None)
             self._preview_2d.set_groups(self._display_groups)
             self._preview_2d.set_overflow(self._overflow)
         else:  # 3d
             self._preview_3d.set_groups(self._display_groups)
 
     def _raw_placed_groups(self) -> List[PathGroup]:
-        """Source groups with only the basic placement transform (no fill/optimize)."""
+        """Source groups with placement transform applied. Draw layer groups pass through."""
         pa = self.settings.path
         sc = pa.scale / 100.0
+        draw_ids = {
+            id(g)
+            for layer in self._layers if layer.get('is_draw', False)
+            for g in layer['groups']
+        }
         result = []
         for grp in self._active_source_groups():
-            paths = [p.transformed(sc, pa.offset_x, pa.offset_y, pa.rotation)
-                     for p in grp.paths]
-            result.append(PathGroup(color=grp.color, label=grp.label,
-                                    paths=paths, pen_change_before=grp.pen_change_before))
+            if id(grp) in draw_ids:
+                result.append(grp)   # already in bed coords
+            else:
+                paths = [p.transformed(sc, pa.offset_x, pa.offset_y, pa.rotation)
+                         for p in grp.paths]
+                result.append(PathGroup(color=grp.color, label=grp.label,
+                                        paths=paths, pen_change_before=grp.pen_change_before))
         return result
 
     # ═══════════════════════════════════════════════════ Generate button pulse
@@ -472,7 +524,15 @@ class MainWindow(QMainWindow):
         # Refresh raw canvas with latest placement
         if self._view_mode == "raw":
             if self._is_image_mode():
-                self._raw_view.update_bed_overlay()
+                if self._raw_show_params:
+                    self._raw_view.update_bed_overlay()
+                else:
+                    # Placement view: repaint with current settings (bbox auto-refreshes)
+                    draw_groups = [g for l in self._layers
+                                   if l.get('is_draw', False) and l.get('visible', True)
+                                   for g in l['groups']]
+                    self._preview_2d.set_groups(draw_groups)
+                    self._preview_2d.update()
             else:
                 self._preview_2d.set_groups(self._raw_placed_groups())
                 self._preview_2d.set_overflow(False)
@@ -627,11 +687,23 @@ class MainWindow(QMainWindow):
         pa = self.settings.path
         fi = self.settings.fill
         ordered = self._path_list.current_groups() or source
+
+        # Groups from draw layers are already in bed-mm coordinates; no transform needed
+        draw_group_ids = {
+            id(g)
+            for layer in self._layers if layer.get('is_draw', False)
+            for g in layer['groups']
+        }
+
         result: List[PathGroup] = []
         for grp in ordered:
-            new_paths = [p.transformed(pa.scale / 100.0, pa.offset_x,
-                                       pa.offset_y, pa.rotation)
-                         for p in grp.paths]
+            if id(grp) in draw_group_ids:
+                # User-drawn paths: already at final bed coordinates
+                new_paths = list(grp.paths)
+            else:
+                new_paths = [p.transformed(pa.scale / 100.0, pa.offset_x,
+                                           pa.offset_y, pa.rotation)
+                             for p in grp.paths]
             fills = generate_fills_for_paths(new_paths, fi) if fi.enabled else []
             if fi.layer_order == "outline_first":   combined = new_paths + fills
             elif fi.layer_order == "fill_first":    combined = fills + new_paths
@@ -675,7 +747,9 @@ class MainWindow(QMainWindow):
         self._status.showMessage(
             f"有効エリア: {ew:.1f}×{eh:.1f}mm  |  {stats}{overflow_str}{pending_str}")
 
-        has_content = bool(self._active_source_groups()) or bool(self._raw_image_path)
+        has_draw = any(l.get('is_draw', False) and l.get('groups')
+                       for l in self._layers)
+        has_content = bool(self._active_source_groups()) or bool(self._raw_image_path) or has_draw
         is_enabled  = not self._overflow and has_content
         self._btn_gen.setEnabled(is_enabled)
         if is_enabled and self._preview_dirty:
@@ -792,6 +866,11 @@ class MainWindow(QMainWindow):
             self._preview_2d.set_groups(self._raw_placed_groups())
         self._mark_preview_dirty()
 
+    def _on_img_params_toggled(self, show_params: bool):
+        """Toggle between placement view (Preview2D+bg) and GIMP extraction params."""
+        self._raw_show_params = show_params
+        self._set_view("raw")
+
     def _on_tool_changed(self, tool: str):
         """Raw toolbar tool selection."""
         self._preview_2d.set_active_tool(tool)
@@ -904,12 +983,16 @@ class MainWindow(QMainWindow):
                                 "パスが有効描画エリアをはみ出しています。\n"
                                 "配置を調整してください。")
             return
-        # 1. Extract raster image if pending
-        if not self._active_source_groups() and self._raw_image_path:
-            if not self._extract_image_now():
-                return
+        # 1. Extract raster image if pending (may have draw layers on top)
+        if self._raw_image_path:
+            img_layer = next((l for l in self._layers
+                              if l['filepath'] == self._raw_image_path), None)
+            if img_layer is not None and not img_layer.get('groups'):
+                if not self._extract_image_now():
+                    return
         if not self._active_source_groups():
-            QMessageBox.information(self, "未読み込み", "先にファイルを開いてください。")
+            QMessageBox.information(self, "未読み込み",
+                                    "先にファイルを開くか、描画レイヤーに図形を描いてください。")
             return
         # 2. Full processing pipeline
         self._refresh_display()

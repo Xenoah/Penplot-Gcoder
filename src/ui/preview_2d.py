@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QPen, QColor, QFont, QWheelEvent, QCursor, QPainterPath,
+    QPixmap,
 )
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 
@@ -54,6 +55,13 @@ class Preview2D(QWidget):
 
         self._bbox: Optional[Tuple[float, float, float, float]] = None
 
+        # ── Background image (for Raw image mode placement view) ─────────────
+        self._bg_pixmap: Optional[QPixmap] = None
+        self._bg_filepath: str = ""
+
+        # ── Interactive flag (False = read-only, no edits) ────────────────
+        self._interactive: bool = True
+
         # ── Drawing tool state ──────────────────────────────────────────────
         self._tool          = _TOOL_SELECT  # active tool
         self._draw_color    = "#ff0000"     # colour for new paths
@@ -82,6 +90,24 @@ class Preview2D(QWidget):
     def set_draw_limit(self, n: int):
         """Show only the first n paths (−1 = all)."""
         self._draw_limit = n
+        self.update()
+
+    def set_interactive(self, enabled: bool):
+        """True = allow placement editing and drawing; False = view-only (pan/zoom only)."""
+        self._interactive = enabled
+        if not enabled:
+            self._cancel_draw()
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def set_background_image(self, filepath: Optional[str]):
+        """Load a raster image to display as background (for image-mode placement)."""
+        if not filepath:
+            self._bg_pixmap   = None
+            self._bg_filepath = ""
+        elif filepath != self._bg_filepath:
+            pix = QPixmap(filepath)
+            self._bg_pixmap   = pix if not pix.isNull() else None
+            self._bg_filepath = filepath if self._bg_pixmap else ""
         self.update()
 
     def set_active_tool(self, tool: str):
@@ -134,7 +160,17 @@ class Preview2D(QWidget):
             for p in g.paths:
                 for x, y in p.points:
                     xs.append(x); ys.append(y)
-        return (min(xs), min(ys), max(xs), max(ys)) if xs else None
+        if xs:
+            return (min(xs), min(ys), max(xs), max(ys))
+        # Synthesize bbox from background image so it can be dragged/scaled
+        if self._bg_pixmap is not None:
+            pa = self.settings.path
+            sc = pa.scale / 100.0
+            W  = self._bg_pixmap.width()
+            H  = self._bg_pixmap.height()
+            return (pa.offset_x, pa.offset_y,
+                    pa.offset_x + W * sc, pa.offset_y + H * sc)
+        return None
 
     def _check_overflow(self) -> bool:
         x_min, y_min, x_max, y_max = self.settings.effective_area()
@@ -179,6 +215,10 @@ class Preview2D(QWidget):
         super().keyPressEvent(event)
 
     def paintEvent(self, _):
+        # Keep bbox fresh when background image placement changes
+        if self._bg_pixmap is not None:
+            self._bbox = self._compute_bbox()
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#2b2b2b"))
@@ -205,6 +245,9 @@ class Preview2D(QWidget):
         y = 0.0
         while y <= by:
             painter.drawLine(self._w2s(0, y), self._w2s(bx, y)); y += 10
+
+        # Background image (Raw image mode placement preview)
+        self._paint_background_image(painter)
 
         # Paths (respecting draw limit)
         all_paths = [p for g in self.groups for p in g.paths]
@@ -253,6 +296,35 @@ class Preview2D(QWidget):
             painter.drawText(8, 22, "\u26a0 \u30d1\u30b9\u304c\u6709\u52b9\u63cf\u753b\u30a8\u30ea\u30a2\u3092\u306f\u307f\u51fa\u3057\u3066\u3044\u307e\u3059")
 
         painter.end()
+
+    def _paint_background_image(self, painter: QPainter):
+        """Draw the background raster image at its placement position on the bed."""
+        if self._bg_pixmap is None:
+            return
+        pa  = self.settings.path
+        sc  = pa.scale / 100.0
+        W   = self._bg_pixmap.width()
+        H   = self._bg_pixmap.height()
+        by  = self.settings.machine.bed_y
+
+        # Image center in bed mm (Y-up)
+        cx_mm = pa.offset_x + W * sc / 2.0
+        cy_mm = pa.offset_y + H * sc / 2.0   # image origin is bottom-left in bed coords
+
+        sc_center = self._w2s(cx_mm, cy_mm)
+        img_w_px  = W * sc * self._vscale
+        img_h_px  = H * sc * self._vscale
+
+        painter.save()
+        painter.translate(sc_center)
+        # Screen Y is flipped relative to bed Y, so negate rotation
+        painter.rotate(-pa.rotation)
+        painter.setOpacity(0.75)
+        source_rect = QRectF(0, 0, W, H)
+        target_rect = QRectF(-img_w_px / 2, -img_h_px / 2, img_w_px, img_h_px)
+        painter.drawPixmap(target_rect.toRect(), self._bg_pixmap, source_rect.toRect())
+        painter.setOpacity(1.0)
+        painter.restore()
 
     def _paint_draw_overlay(self, painter: QPainter):
         """Draw in-progress stroke / shape preview."""
@@ -316,8 +388,16 @@ class Preview2D(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
+        # Recompute bbox (may depend on live placement settings for image mode)
+        self._bbox = self._compute_bbox()
+
         pos = QPointF(event.position())
         wx, wy = self._s2w(pos.x(), pos.y())
+
+        # Non-interactive (Preview/3D tab): only allow pan
+        if not self._interactive:
+            self._begin_pan(pos)
+            return
 
         if event.button() == Qt.MouseButton.LeftButton:
             # ── Drawing tools ──────────────────────────────────────────
@@ -367,6 +447,12 @@ class Preview2D(QWidget):
         pos = QPointF(event.position())
         wx, wy = self._s2w(pos.x(), pos.y())
         self.cursor_moved.emit(wx, wy)
+
+        if not self._interactive:
+            if self._interact == _PAN:
+                self._voffset = self._drag_voffset_start + (pos - self._drag_screen_start)
+                self.update()
+            return
 
         # Drawing live preview
         if self._tool in _DRAW_TOOLS:
