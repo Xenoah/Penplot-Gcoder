@@ -22,8 +22,8 @@ class MachineSettings:
 class PenSettings:
     pen_down_z: float = 0.0
     pen_up_z: float = 5.0
-    pen_down_speed: float = 300.0
-    pen_up_speed: float = 1000.0
+    pen_down_speed: float = 5.0     # mm/s
+    pen_up_speed: float = 17.0      # mm/s
     touchdown_delay: int = 0        # ms
     liftup_delay: int = 0           # ms
     offset_x: float = 0.0
@@ -33,10 +33,10 @@ class PenSettings:
 
 @dataclass
 class SpeedSettings:
-    draw_speed: float = 1500.0
-    travel_speed: float = 6000.0
-    acceleration: float = 1000.0
-    corner_speed: float = 5.0
+    draw_speed: float = 25.0        # mm/s
+    travel_speed: float = 100.0     # mm/s
+    acceleration: float = 1000.0    # mm/s²
+    corner_speed: float = 5.0       # mm/s
 
 
 @dataclass

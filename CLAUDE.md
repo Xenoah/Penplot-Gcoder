@@ -448,6 +448,26 @@ opencv-python>=4.8.0
 | 実装 | Raw タブ描画ツール (フリーハンド/パス/直線/矩形/楕円) + src/ui/raw_toolbar.py | 完了 |
 | 実装 | 描画レイヤー (ユーザー作成・追加/削除/リネーム) + アクティブレイヤー選択 | 完了 |
 | 実装 | PenPath.stroke_width_mm 追加 (描画ストローク幅保持・プレビュー表示反映) | 完了 |
+| 実装 | DirtyLevel 多段化 (CLEAN/GCODE/PIPELINE/EXTRACT) + 設定カテゴリ別スマート無効化 | 完了 |
+| 実装 | バックグラウンドワーカー src/core/worker.py (PipelineWorker / QThread / job_id競合防止) | 完了 |
+| 実装 | Generate を非同期化 (GCODE-only は同期ファストパス / PIPELINE以上はワーカー) | 完了 |
+| 実装 | Undo 拡張 (AddPathCommand / AddLayerCommand / DeleteLayerCommand / ReorderGroupCommand) | 完了 |
+| 実装 | バグ修正: add_layer DIRTY 欠落修正 / overflow 判定を pipeline 後に一本化 / closeEvent でワーカー安全終了 | 完了 |
+
+---
+
+## 状態管理仕様 (DirtyLevel)
+
+| レベル | 意味 | 発生条件 |
+|-------|------|---------|
+| CLEAN | 全て最新 | Generate 完了後 |
+| GCODE | G-code 再生成のみ必要 | 速度/Z高さ/開始終了コード変更 |
+| PIPELINE | 変換→塗りつぶし→最適化→G-code 全て必要 | 配置/Fill/Machine/Penオフセット変更・パス順序変更 |
+| EXTRACT | 画像抽出→パイプライン→G-code 全て必要 | 画像ファイル読み込み・抽出パラメータ変更 |
+
+- レベルは上がるのみ (ダウングレード不可、抽出完了後は PIPELINE に落とす例外あり)
+- `_settings_hash()` で geo カテゴリ (配置・Fill・Machine・Penオフセット) と gcode カテゴリを区別
+- バックグラウンドワーカーは `job_id` で古い結果を自動破棄
 
 ---
 
@@ -467,3 +487,4 @@ opencv-python>=4.8.0
 | 2026-03-07 | v8 | UIをChituboxライクな1画面構成に全面再設計。左=設定パネル/中央=プレビュー(Raw 2D・変換後 2D・3D切り替え)/右=パスリスト+統計/下部バー=配置コントロール+アクションボタン。ファイル読み込み時にRaw→変換後を自動切り替えで両方確認できる。 | ユーザー要件変更 |
 | 2026-03-07 | v11 | 配置コントロール (Scale/X/Y/R/中央/ドラッグ) を Raw タブ限定に変更 (Preview・3D タブでは無効化)。Raw 画像モードに mm 単位ベッド境界・有効エリアオーバーレイを追加 (設定変更でリアルタイム更新)。_source_groups+_source_files を _layers 構造 [{name,filepath,groups,visible}] に置き換え。PathListPanel をレイヤー対応に全面改修 (ファイル単位レイヤーヘッダー・表示/非表示チェックボックス・グループ並び替え)。 | ユーザー要件: Raw でのみ配置操作・ベッドサイズ表示・レイヤー管理 |
 | 2026-03-08 | v12 | Raw タブにツールバー (src/ui/raw_toolbar.py) を追加。描画ツール: フリーハンド(✏)・パス(📐)・直線・矩形・楕円、ストローク幅(mm)/色選択付き。Preview2D に全描画ツール対応の mouse イベント処理を追加 (path_drawn シグナル)。描画ストロークはアクティブな描画レイヤーへ追加。PathListPanel にアクティブレイヤー選択 (クリック)・リネーム (ダブルクリック)・追加 (+)/削除 (−) ボタンを追加。PenPath に stroke_width_mm フィールドを追加。 | ユーザー要件: Raw モードで直感的な描画・ペイントソフト風レイヤー管理 |
+| 2026-03-08 | v13 | GPT レビュー指摘に基づく大規模アーキテクチャ改善。DirtyLevel enum 多段化 (CLEAN/GCODE/PIPELINE/EXTRACT)。設定カテゴリ別スマート無効化 (_settings_hash による geo/gcode 区別)。Generate をバックグラウンドワーカー非同期化 (src/core/worker.py PipelineWorker QThread、job_id 競合防止、キャンセル機構、プログレスバー)。GCODE-only 変更はファストパスで同期実行。Undo 拡張 (AddPathCommand/AddLayerCommand/DeleteLayerCommand/ReorderGroupCommand)。バグ修正: add_layer DIRTY 欠落・overflow 判定 pipeline 後に一本化・closeEvent ワーカー安全停止。 | GPT アーキテクチャレビュー対応 |

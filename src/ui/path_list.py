@@ -166,7 +166,7 @@ class PathListPanel(QWidget):
             visible   (bool, default True)
             is_draw   (bool, default False) — user-created draw layer
         """
-        self._layers = [dict(l) for l in layers]
+        self._layers = list(layers)  # share same dict objects so visibility changes propagate
         if self._active_layer_idx >= len(self._layers):
             self._active_layer_idx = len(self._layers) - 1
         self._rebuild_list()

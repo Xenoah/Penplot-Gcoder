@@ -16,10 +16,10 @@ def _resolve(template: str, settings: AppSettings) -> str:
     mapping = {
         "{pen_down_z}":     str(p.pen_down_z),
         "{pen_up_z}":       str(p.pen_up_z),
-        "{pen_down_speed}": str(int(p.pen_down_speed)),
-        "{pen_up_speed}":   str(int(p.pen_up_speed)),
-        "{draw_speed}":     str(int(sp.draw_speed)),
-        "{travel_speed}":   str(int(sp.travel_speed)),
+        "{pen_down_speed}": str(int(p.pen_down_speed * 60)),
+        "{pen_up_speed}":   str(int(p.pen_up_speed * 60)),
+        "{draw_speed}":     str(int(sp.draw_speed * 60)),
+        "{travel_speed}":   str(int(sp.travel_speed * 60)),
         "{offset_x}":       str(ox),
         "{offset_y}":       str(oy),
         "{offset_z}":       str(oz),
@@ -36,10 +36,10 @@ def _resolve(template: str, settings: AppSettings) -> str:
 
 def _estimate_time(groups: List[PathGroup], settings: AppSettings) -> Tuple[float, float]:
     """Return (total_draw_mm, estimated_seconds)."""
-    draw_speed = settings.speed.draw_speed / 60.0    # mm/s
-    travel_speed = settings.speed.travel_speed / 60.0
-    pen_down_speed = settings.pen.pen_down_speed / 60.0
-    pen_up_speed = settings.pen.pen_up_speed / 60.0
+    draw_speed = settings.speed.draw_speed          # mm/s
+    travel_speed = settings.speed.travel_speed
+    pen_down_speed = settings.pen.pen_down_speed
+    pen_up_speed = settings.pen.pen_up_speed
     z_travel = abs(settings.pen.pen_up_z - settings.pen.pen_down_z)
 
     total_draw = 0.0
@@ -134,7 +134,7 @@ def generate_gcode(groups: List[PathGroup], settings: AppSettings,
             # Travel to start
             sx = path.points[0][0] + ox
             sy = path.points[0][1] + oy
-            lines.append(f"G1 X{sx:.4f} Y{sy:.4f} F{int(sp.travel_speed)}")
+            lines.append(f"G1 X{sx:.4f} Y{sy:.4f} F{int(sp.travel_speed * 60)}")
 
             # Pen down
             lines.append(pen_down_cmd)
@@ -147,7 +147,7 @@ def generate_gcode(groups: List[PathGroup], settings: AppSettings,
             for pt in path.points:
                 px = pt[0] + ox
                 py = pt[1] + oy
-                lines.append(f"G1 X{px:.4f} Y{py:.4f} F{int(sp.draw_speed)}")
+                lines.append(f"G1 X{px:.4f} Y{py:.4f} F{int(sp.draw_speed * 60)}")
 
             # Liftup delay
             if pen.liftup_delay > 0:

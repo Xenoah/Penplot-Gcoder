@@ -128,8 +128,8 @@ class SettingsPanel(QWidget):
         f1 = QFormLayout(grp_motion)
         self._pen_down_z = _spin(-10, 50, 2, 0.1, " mm")
         self._pen_up_z = _spin(0, 50, 2, 0.1, " mm")
-        self._pen_down_speed = _spin(1, 10000, 0, 10, " mm/min")
-        self._pen_up_speed = _spin(1, 10000, 0, 10, " mm/min")
+        self._pen_down_speed = _spin(0.1, 200, 1, 1, " mm/s")
+        self._pen_up_speed = _spin(0.1, 200, 1, 1, " mm/s")
         self._touchdown_delay = _ispin(0, 10000, " ms")
         self._liftup_delay = _ispin(0, 10000, " ms")
         f1.addRow("Pen Down Z:", self._pen_down_z)
@@ -167,8 +167,8 @@ class SettingsPanel(QWidget):
         form = QFormLayout(w)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-        self._draw_speed = _spin(1, 60000, 0, 100, " mm/min")
-        self._travel_speed = _spin(1, 60000, 0, 100, " mm/min")
+        self._draw_speed = _spin(0.1, 500, 1, 1, " mm/s")
+        self._travel_speed = _spin(0.1, 500, 1, 5, " mm/s")
         self._acceleration = _spin(1, 10000, 0, 100, " mm/s²")
         self._corner_speed = _spin(0, 1000, 1, 0.5, " mm/s")
 

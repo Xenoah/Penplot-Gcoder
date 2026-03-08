@@ -9,8 +9,8 @@
   "pen": {
     "pen_down_z": 0.0,
     "pen_up_z": 0.0,
-    "pen_down_speed": 1.0,
-    "pen_up_speed": 1.0,
+    "pen_down_speed": 0.1,
+    "pen_up_speed": 0.1,
     "touchdown_delay": 0,
     "liftup_delay": 0,
     "offset_x": 0.0,
@@ -18,15 +18,15 @@
     "offset_z": 0.0
   },
   "speed": {
-    "draw_speed": 1.0,
-    "travel_speed": 1.0,
+    "draw_speed": 0.1,
+    "travel_speed": 0.1,
     "acceleration": 1.0,
     "corner_speed": 0.0
   },
   "path": {
-    "scale": 0.1,
-    "offset_x": 0.0,
-    "offset_y": 0.0,
+    "scale": 0.9,
+    "offset_x": 0.6,
+    "offset_y": 0.6,
     "rotation": 0.0,
     "optimize": false,
     "optimize_algorithm": "Greedy",

@@ -162,14 +162,27 @@ class Preview2D(QWidget):
                     xs.append(x); ys.append(y)
         if xs:
             return (min(xs), min(ys), max(xs), max(ys))
-        # Synthesize bbox from background image so it can be dragged/scaled
+        # Synthesize bbox from background image (accounts for rotation)
         if self._bg_pixmap is not None:
-            pa = self.settings.path
-            sc = pa.scale / 100.0
-            W  = self._bg_pixmap.width()
-            H  = self._bg_pixmap.height()
-            return (pa.offset_x, pa.offset_y,
-                    pa.offset_x + W * sc, pa.offset_y + H * sc)
+            pa  = self.settings.path
+            sc  = pa.scale / 100.0
+            W   = self._bg_pixmap.width()
+            H   = self._bg_pixmap.height()
+            # Image center in bed coords
+            cx  = pa.offset_x + W * sc / 2.0
+            cy  = pa.offset_y + H * sc / 2.0
+            hw  = W * sc / 2.0
+            hh  = H * sc / 2.0
+            if pa.rotation == 0.0:
+                return (cx - hw, cy - hh, cx + hw, cy + hh)
+            # Rotate 4 corners around center and compute AABB
+            import math
+            rad = math.radians(pa.rotation)
+            cos_r, sin_r = math.cos(rad), math.sin(rad)
+            corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+            rxs = [cx + dx * cos_r - dy * sin_r for dx, dy in corners]
+            rys = [cy + dx * sin_r + dy * cos_r for dx, dy in corners]
+            return (min(rxs), min(rys), max(rxs), max(rys))
         return None
 
     def _check_overflow(self) -> bool:
@@ -273,7 +286,8 @@ class Preview2D(QWidget):
             prev_end = path.points[-1]
 
         # Selection bbox + handles (select tool only)
-        if self._tool == _TOOL_SELECT and self._bbox and self.groups:
+        has_content = bool(self.groups) or (self._bg_pixmap is not None)
+        if self._tool == _TOOL_SELECT and self._bbox and has_content:
             x0, y0, x1, y1 = self._bbox
             pen = QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine)
             pen.setDashPattern([4, 4])
@@ -422,7 +436,8 @@ class Preview2D(QWidget):
                 return
 
             # ── Select / placement ─────────────────────────────────────
-            if self._bbox and self.groups:
+            has_content = bool(self.groups) or (self._bg_pixmap is not None)
+            if self._bbox and has_content:
                 hit = self._hit_handle(pos)
                 if hit:
                     self._begin_scale(pos, hit); return
@@ -486,7 +501,8 @@ class Preview2D(QWidget):
                 say    = (ay - oy) / old_s
                 self.placement_changed.emit(ax - sax*(ns/100), ay - say*(ns/100), ns)
 
-        if self._interact == _IDLE and self._bbox and self.groups:
+        has_content = bool(self.groups) or (self._bg_pixmap is not None)
+        if self._interact == _IDLE and self._bbox and has_content:
             if self._hit_handle(pos):
                 self.setCursor(QCursor(Qt.CursorShape.SizeFDiagCursor))
             elif self._inside_bbox(pos):

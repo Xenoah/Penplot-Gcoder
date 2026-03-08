@@ -1,9 +1,12 @@
 """Main application window — single-screen slicer layout."""
 from __future__ import annotations
+import copy
 import os
 import re
 import shutil
 import tempfile
+from dataclasses import asdict
+from enum import IntEnum
 from typing import List, Optional
 
 import numpy as np
@@ -14,11 +17,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QStatusBar, QFileDialog,
     QMessageBox, QSplitter, QDoubleSpinBox, QSlider, QFrame,
-    QApplication,
+    QApplication, QProgressBar,
 )
 
 from src.models.settings import AppSettings
-from src.models.pen_path import PathGroup
+from src.models.pen_path import PenPath, PathGroup
 from src.ui.settings_panel import SettingsPanel
 from src.ui.preview_2d import Preview2D
 from src.ui.preview_3d import Preview3D
@@ -29,6 +32,17 @@ from src.core.bed_calculator import paths_overflow
 from src.core.path_optimizer import optimize
 from src.core.fill_generator import generate_fills_for_paths
 from src.core.gcode_generator import generate_gcode
+from src.core.worker import PipelineWorker
+
+
+# ---------------------------------------------------------------------------
+# Dirty level — cascading invalidation
+# ---------------------------------------------------------------------------
+class DirtyLevel(IntEnum):
+    CLEAN    = 0   # everything up-to-date
+    GCODE    = 1   # display_groups valid; just regenerate G-code text
+    PIPELINE = 2   # need transform → fill → optimize → gcode
+    EXTRACT  = 3   # need image extraction → pipeline → gcode
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +68,10 @@ def _safe_filepath(filepath: str) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Undo
+# Undo commands
 # ---------------------------------------------------------------------------
 class PlacementCommand(QUndoCommand):
+    """Scale / offset / rotation change."""
     def __init__(self, win, old, new):
         super().__init__("配置変更")
         self._win = win
@@ -70,10 +85,106 @@ class PlacementCommand(QUndoCommand):
         self._win._prev_snap = v
         self._win._settings_panel._refresh_from_settings()
         self._win._sync_bottom_bar()
-        self._win._mark_preview_dirty()   # placement change → Preview stale
+        self._win._set_dirty(DirtyLevel.PIPELINE)
 
     def undo(self):  self._apply(self._old)
     def redo(self):  self._apply(self._new)
+
+
+class AddPathCommand(QUndoCommand):
+    """User drew a stroke → added to draw layer."""
+    def __init__(self, win, layer: dict, group: PathGroup, path: PenPath,
+                 layer_was_new: bool):
+        super().__init__("パス描画")
+        self._win          = win
+        self._layer        = layer
+        self._group        = group
+        self._path         = path
+        self._layer_was_new = layer_was_new
+
+    def undo(self):
+        if self._path in self._group.paths:
+            self._group.paths.remove(self._path)
+        # Remove empty group
+        if not self._group.paths and self._group in self._layer['groups']:
+            self._layer['groups'].remove(self._group)
+        # Remove layer if it was freshly created and now empty
+        if self._layer_was_new and not self._layer['groups']:
+            if self._layer in self._win._layers:
+                self._win._layers.remove(self._layer)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+    def redo(self):
+        if self._layer not in self._win._layers:
+            self._win._layers.append(self._layer)
+        if self._group not in self._layer['groups']:
+            self._layer['groups'].append(self._group)
+        if self._path not in self._group.paths:
+            self._group.paths.append(self._path)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+
+class AddLayerCommand(QUndoCommand):
+    """User added a draw layer."""
+    def __init__(self, win, layer: dict):
+        super().__init__("レイヤー追加")
+        self._win   = win
+        self._layer = layer
+
+    def undo(self):
+        if self._layer in self._win._layers:
+            self._win._layers.remove(self._layer)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+    def redo(self):
+        if self._layer not in self._win._layers:
+            self._win._layers.append(self._layer)
+        idx = self._win._layers.index(self._layer)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._path_list.set_active_layer(idx)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+
+class DeleteLayerCommand(QUndoCommand):
+    """User deleted a draw layer."""
+    def __init__(self, win, layer: dict, idx: int):
+        super().__init__("レイヤー削除")
+        self._win   = win
+        self._layer = layer
+        self._idx   = idx
+
+    def undo(self):
+        self._win._layers.insert(self._idx, self._layer)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._path_list.set_active_layer(self._idx)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+    def redo(self):
+        if self._layer in self._win._layers:
+            self._win._layers.remove(self._layer)
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+
+class ReorderGroupCommand(QUndoCommand):
+    """Group reorder in path list."""
+    def __init__(self, win, layer: dict, old_groups: list, new_groups: list):
+        super().__init__("グループ並び替え")
+        self._win        = win
+        self._layer      = layer
+        self._old_groups = old_groups
+        self._new_groups = new_groups
+
+    def _apply(self, groups):
+        self._layer['groups'][:] = groups
+        self._win._path_list.set_layers(self._win._layers)
+        self._win._set_dirty(DirtyLevel.PIPELINE)
+
+    def undo(self):  self._apply(self._old_groups)
+    def redo(self):  self._apply(self._new_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -110,17 +221,24 @@ class MainWindow(QMainWindow):
         self.settings  = AppSettings()
         self._load_autosave()
 
-        # _layers: [{name, filepath, groups, visible}]  — one entry per imported file
+        # _layers: [{name, filepath, groups, visible, is_draw?}]
         self._layers:         List[dict] = []
         self._display_groups: List[PathGroup] = []
         self._raw_image_path  = ""
         self._raw_view_dirty  = False
-        self._preview_dirty   = False   # True when Generate is needed
+        self._dirty_level     = DirtyLevel.CLEAN   # multi-stage invalidation
         self._overflow        = False
         self._gcode_text: Optional[str] = None
         self._applying        = False
         self._view_mode       = "raw"   # "raw" | "transformed" | "3d"
-        self._raw_show_params = False   # True = show GIMP extraction params panel
+        self._raw_show_params = False
+
+        # Background worker state
+        self._worker: Optional[PipelineWorker] = None
+        self._job_id: int = 0
+
+        # Settings snapshot for smart invalidation
+        self._prev_settings_hash = self._settings_hash()
 
         self._undo_stack = QUndoStack(self)
         self._prev_snap  = self._snap()
@@ -162,6 +280,13 @@ class MainWindow(QMainWindow):
         self._pulse_timer.setInterval(550)
         self._pulse_timer.timeout.connect(self._pulse_step)
         self._pulse_state = False
+
+        # Progress bar (shown during background pipeline)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)  # indeterminate
+        self._progress_bar.setFixedHeight(4)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setVisible(False)
 
         self.setWindowTitle("Penplot-Gcoder")
         self.resize(1400, 860)
@@ -248,6 +373,7 @@ class MainWindow(QMainWindow):
             "background:#1e1e1e; color:#ccc; padding:3px 6px; font-size:11px;")
         self._info_bar.setFixedHeight(20)
         cvl.addWidget(self._info_bar)
+        cvl.addWidget(self._progress_bar)
         splitter.addWidget(centre)
 
         # Right: path list + stats
@@ -506,28 +632,46 @@ class MainWindow(QMainWindow):
         self._btn_gen.setStyleSheet(
             self._PULSE_A if self._pulse_state else self._PULSE_B)
 
-    # ═══════════════════════════════════════════════════ Preview dirty flag
+    # ═══════════════════════════════════════════════════ Dirty / invalidation
 
-    def _mark_preview_dirty(self):
-        """Invalidate the Preview. Raw view updates live; Preview waits for Generate."""
-        self._preview_dirty = True
-        # Clear stale display data
-        if self._display_groups:
-            self._display_groups = []
-            self._overflow = False
-            self._update_seekbar_max()
-            if self._view_mode == "transformed":
-                self._preview_2d.set_groups([])
-                self._preview_2d.set_overflow(False)
-            elif self._view_mode == "3d":
-                self._preview_3d.set_groups([])
-        # Refresh raw canvas with latest placement
+    def _settings_hash(self) -> dict:
+        """Snapshot used to detect which settings category changed."""
+        s = self.settings
+        return {
+            'geo':   (asdict(s.machine), asdict(s.path), asdict(s.fill),
+                      s.pen.offset_x, s.pen.offset_y, s.pen.offset_z),
+            'gcode': (s.pen.pen_down_z, s.pen.pen_up_z,
+                      s.pen.pen_down_speed, s.pen.pen_up_speed,
+                      s.pen.touchdown_delay, s.pen.liftup_delay,
+                      asdict(s.speed), asdict(s.gcode)),
+        }
+
+    def _set_dirty(self, level: DirtyLevel) -> None:
+        """Raise dirty level (never lower it). Cascade state clearing."""
+        if level > self._dirty_level:
+            self._dirty_level = level
+
+            # Cascade: all levels ≥ GCODE invalidate gcode text
+            self._gcode_text = None
+
+            # Cascade: PIPELINE and above invalidate display groups
+            if level >= DirtyLevel.PIPELINE:
+                if self._display_groups:
+                    self._display_groups = []
+                    self._overflow = False
+                    self._update_seekbar_max()
+                    if self._view_mode == "transformed":
+                        self._preview_2d.set_groups([])
+                        self._preview_2d.set_overflow(False)
+                    elif self._view_mode == "3d":
+                        self._preview_3d.set_groups([])
+
+        # Always refresh raw canvas (placement may change without dirty level rising)
         if self._view_mode == "raw":
             if self._is_image_mode():
                 if self._raw_show_params:
                     self._raw_view.update_bed_overlay()
                 else:
-                    # Placement view: repaint with current settings (bbox auto-refreshes)
                     draw_groups = [g for l in self._layers
                                    if l.get('is_draw', False) and l.get('visible', True)
                                    for g in l['groups']]
@@ -536,7 +680,12 @@ class MainWindow(QMainWindow):
             else:
                 self._preview_2d.set_groups(self._raw_placed_groups())
                 self._preview_2d.set_overflow(False)
+
         self._update_status()
+
+    # Legacy alias — keeps old call sites working during transition
+    def _mark_preview_dirty(self):
+        self._set_dirty(DirtyLevel.PIPELINE)
 
     # ═══════════════════════════════════════════════════ play / seekbar
 
@@ -621,10 +770,12 @@ class MainWindow(QMainWindow):
                              'groups': groups, 'visible': True})
 
     def _finalize_load(self, paths: List[str]):
+        self._cancel_worker()
         self._gcode_text     = None
         self._display_groups = []
-        self._preview_dirty  = True
+        self._dirty_level    = DirtyLevel.EXTRACT if self._raw_image_path else DirtyLevel.PIPELINE
         self._raw_view_dirty = True
+        self._prev_settings_hash = self._settings_hash()
         self._path_list.set_layers(self._layers)
 
         if len(paths) == 1:
@@ -642,12 +793,18 @@ class MainWindow(QMainWindow):
         self._update_seekbar_max()
         self._update_status()
         self._set_view("raw")   # open in Raw, stay there until Generate
+        # After _set_view loads the bg pixmap, re-sync bottom bar for correct W/H
+        if self._raw_image_path:
+            self._sync_bottom_bar()
 
     def _auto_fit(self, groups: Optional[List[PathGroup]] = None):
         if groups is None:
             groups = self._active_source_groups()
         pts = np.array([pt for g in groups for p in g.paths for pt in p.points])
         if len(pts) == 0:
+            # Image mode: no vector points yet — fit from pixel dimensions
+            if self._raw_image_path:
+                self._auto_fit_image()
             return
         src_w = float(pts[:, 0].max() - pts[:, 0].min())
         src_h = float(pts[:, 1].max() - pts[:, 1].min())
@@ -666,6 +823,32 @@ class MainWindow(QMainWindow):
         pa.scale    = fit
         pa.offset_x = tx - cx * fit / 100.0
         pa.offset_y = ty - cy * fit / 100.0
+        pa.rotation = 0.0
+        self._prev_snap = self._snap()
+        self._applying  = False
+        self._settings_panel._refresh_from_settings()
+        self._sync_bottom_bar()
+
+    def _auto_fit_image(self):
+        """Fit raw image to effective drawing area using pixel dimensions as source size."""
+        from PyQt6.QtGui import QPixmap
+        pix = QPixmap(self._raw_image_path)
+        W, H = pix.width(), pix.height()
+        if W <= 0 or H <= 0:
+            return
+        x_min, y_min, x_max, y_max = self.settings.effective_area()
+        eff_w, eff_h = x_max - x_min, y_max - y_min
+        # Scale so the image fills ~88% of the effective area (preserve aspect ratio)
+        fit_sc = min(eff_w / W, eff_h / H) * 0.88 * 100.0  # percent
+        sc = fit_sc / 100.0
+        # Center image in effective area
+        cx = (x_min + x_max) / 2
+        cy = (y_min + y_max) / 2
+        self._applying = True
+        pa = self.settings.path
+        pa.scale    = fit_sc
+        pa.offset_x = cx - W * sc / 2.0
+        pa.offset_y = cy - H * sc / 2.0
         pa.rotation = 0.0
         self._prev_snap = self._snap()
         self._applying  = False
@@ -734,7 +917,8 @@ class MainWindow(QMainWindow):
         eff = self.settings.effective_area()
         ew, eh = eff[2] - eff[0], eff[3] - eff[1]
         overflow_str = "  ⚠ はみ出しあり！" if self._overflow else ""
-        pending_str  = "  ⚙ Generate が必要" if self._preview_dirty else ""
+        is_dirty     = self._dirty_level > DirtyLevel.CLEAN
+        pending_str  = "  ⚙ Generate が必要" if is_dirty else ""
 
         self._info_bar.setText(
             f"有効エリア: {ew:.1f}×{eh:.1f}mm  |  {stats}{overflow_str}{pending_str}")
@@ -743,16 +927,17 @@ class MainWindow(QMainWindow):
             f"パス数: {n}\n" +
             (f"推定時間: {m}m{s:02d}s\n描画距離: {total_mm:.0f}mm" if all_paths else "") +
             ("\n\n⚠ はみ出しあり" if self._overflow else "") +
-            ("\n\n⚙ Generate を押してください" if self._preview_dirty else ""))
+            ("\n\n⚙ Generate を押してください" if is_dirty else ""))
         self._status.showMessage(
             f"有効エリア: {ew:.1f}×{eh:.1f}mm  |  {stats}{overflow_str}{pending_str}")
 
-        has_draw = any(l.get('is_draw', False) and l.get('groups')
-                       for l in self._layers)
+        has_draw    = any(l.get('is_draw', False) and l.get('groups') for l in self._layers)
         has_content = bool(self._active_source_groups()) or bool(self._raw_image_path) or has_draw
-        is_enabled  = not self._overflow and has_content
+        # Disable Generate while worker is running
+        worker_busy = self._worker is not None and self._worker.isRunning()
+        is_enabled  = not self._overflow and has_content and not worker_busy
         self._btn_gen.setEnabled(is_enabled)
-        if is_enabled and self._preview_dirty:
+        if is_enabled and is_dirty:
             self._start_pulse()
         else:
             self._stop_pulse()
@@ -799,11 +984,25 @@ class MainWindow(QMainWindow):
     def _on_settings_changed(self):
         if self._applying:
             return
-        new = self._snap()
-        if new != self._prev_snap:
-            self._push_undo(self._prev_snap, new)
+        # Placement undo (scale/offset/rotation)
+        new_snap = self._snap()
+        if new_snap != self._prev_snap:
+            self._push_undo(self._prev_snap, new_snap)
         self._sync_bottom_bar()
-        self._mark_preview_dirty()
+
+        # Smart invalidation: determine minimum dirty level from what changed
+        new_hash = self._settings_hash()
+        old_hash = self._prev_settings_hash
+        self._prev_settings_hash = new_hash
+
+        if new_hash['geo'] != old_hash['geo']:
+            # Geometry-affecting change: placement, fill, bed size, pen offset
+            self._set_dirty(DirtyLevel.PIPELINE)
+        elif new_hash['gcode'] != old_hash['gcode']:
+            # G-code-only change: speeds, z-heights, start/end code templates
+            self._set_dirty(DirtyLevel.GCODE)
+        # If nothing changed (spurious signal), do nothing
+
         self._autosave_timer.start(1000)
 
     def _on_cursor_moved(self, x: float, y: float):
@@ -819,7 +1018,7 @@ class MainWindow(QMainWindow):
         pa.offset_x = ox; pa.offset_y = oy; pa.scale = scale
         self._applying = False
         self._settings_panel._refresh_from_settings()
-        self._mark_preview_dirty()
+        self._set_dirty(DirtyLevel.PIPELINE)
         self._sync_bottom_bar()
         new = self._snap()
         if new != old:
@@ -861,9 +1060,8 @@ class MainWindow(QMainWindow):
         self._mark_preview_dirty()
 
     def _on_layer_visibility_changed(self):
-        """Layer visibility toggle in path list — refresh raw canvas and mark dirty."""
-        if self._view_mode == "raw" and not self._is_image_mode():
-            self._preview_2d.set_groups(self._raw_placed_groups())
+        """Layer visibility toggle in path list — refresh canvas and mark dirty."""
+        self._push_to_preview()
         self._mark_preview_dirty()
 
     def _on_img_params_toggled(self, show_params: bool):
@@ -876,59 +1074,55 @@ class MainWindow(QMainWindow):
         self._preview_2d.set_active_tool(tool)
 
     def _on_path_drawn(self, pen_path):
-        """User drew a stroke in Preview2D — add it to the active draw layer."""
-        from src.models.pen_path import PathGroup as PG
+        """User drew a stroke in Preview2D — add it to the active draw layer (with Undo)."""
         idx = self._path_list.active_layer_index()
-        # Find or create a draw layer
-        draw_layer = None
+        draw_layer  = None
+        layer_is_new = False
         if 0 <= idx < len(self._layers) and self._layers[idx].get('is_draw', False):
             draw_layer = self._layers[idx]
         else:
-            # Look for any existing draw layer
             for l in self._layers:
                 if l.get('is_draw', False):
                     draw_layer = l
                     break
         if draw_layer is None:
-            # Create a new draw layer
-            draw_layer = {'name': '描画レイヤー', 'filepath': '',
-                          'groups': [], 'visible': True, 'is_draw': True}
-            self._layers.append(draw_layer)
-            new_idx = len(self._layers) - 1
-            self._path_list.set_layers(self._layers)
-            self._path_list.set_active_layer(new_idx)
-        # Add the path as a new group (or extend existing draw group with same color)
-        target_grp = None
+            draw_layer   = {'name': '描画レイヤー', 'filepath': '',
+                            'groups': [], 'visible': True, 'is_draw': True}
+            layer_is_new = True
+            # Don't append yet — AddPathCommand.redo() will do it
+
+        # Find or create group with matching colour
+        target_grp  = None
+        group_is_new = False
         for g in draw_layer['groups']:
             if g.color == pen_path.color:
                 target_grp = g
                 break
         if target_grp is None:
-            target_grp = PG(color=pen_path.color, label=f"Draw ({pen_path.color})")
-            draw_layer['groups'].append(target_grp)
-        target_grp.paths.append(pen_path)
+            target_grp  = PathGroup(color=pen_path.color,
+                                    label=f"Draw ({pen_path.color})")
+            group_is_new = True
+
+        # Use Undo command so the stroke is reversible
+        cmd = AddPathCommand(self, draw_layer, target_grp, pen_path, layer_is_new)
+        self._undo_stack.push(cmd)
+        # cmd.redo() has already been called by push(); sync list view
         self._path_list.set_layers(self._layers)
-        self._mark_preview_dirty()
 
     def _on_add_draw_layer(self):
-        """Add a new empty draw layer."""
+        """Add a new empty draw layer (with Undo)."""
         n = sum(1 for l in self._layers if l.get('is_draw', False)) + 1
         new_layer = {'name': f'描画レイヤー {n}', 'filepath': '',
                      'groups': [], 'visible': True, 'is_draw': True}
-        self._layers.append(new_layer)
-        new_idx = len(self._layers) - 1
-        self._path_list.set_layers(self._layers)
-        self._path_list.set_active_layer(new_idx)
+        cmd = AddLayerCommand(self, new_layer)
+        self._undo_stack.push(cmd)
 
     def _on_delete_layer(self, idx: int):
-        """Delete a draw layer."""
+        """Delete a draw layer (with Undo)."""
         if 0 <= idx < len(self._layers) and self._layers[idx].get('is_draw', False):
-            self._layers.pop(idx)
-            new_active = max(0, idx - 1)
-            self._path_list.set_layers(self._layers)
-            if self._layers:
-                self._path_list.set_active_layer(new_active)
-            self._mark_preview_dirty()
+            layer = self._layers[idx]
+            cmd = DeleteLayerCommand(self, layer, idx)
+            self._undo_stack.push(cmd)
 
     # ═══════════════════════════════════════════════════ Generate
 
@@ -973,33 +1167,146 @@ class MainWindow(QMainWindow):
         self._raw_view_dirty = False
         self._path_list.set_layers(self._layers)
         self._auto_fit()
+        # Downgrade dirty level: extraction done, pipeline still needed
+        if self._dirty_level >= DirtyLevel.EXTRACT:
+            self._dirty_level = DirtyLevel.PIPELINE
         self._status.showMessage(
             f"抽出完了: {sum(len(g.paths) for g in groups)} パス", 3000)
         return True
 
+    # ═══════════════════════════════════════════════════ Generate (async)
+
     def _on_generate(self):
-        if self._overflow:
-            QMessageBox.warning(self, "はみ出しエラー",
-                                "パスが有効描画エリアをはみ出しています。\n"
-                                "配置を調整してください。")
+        """Launch background pipeline worker based on current dirty level."""
+        dirty = self._dirty_level
+        if dirty == DirtyLevel.CLEAN:
             return
-        # 1. Extract raster image if pending (may have draw layers on top)
-        if self._raw_image_path:
-            img_layer = next((l for l in self._layers
-                              if l['filepath'] == self._raw_image_path), None)
-            if img_layer is not None and not img_layer.get('groups'):
-                if not self._extract_image_now():
-                    return
-        if not self._active_source_groups():
+
+        has_draw    = any(l.get('is_draw', False) and l.get('groups') for l in self._layers)
+        has_content = bool(self._active_source_groups()) or bool(self._raw_image_path) or has_draw
+        if not has_content:
             QMessageBox.information(self, "未読み込み",
                                     "先にファイルを開くか、描画レイヤーに図形を描いてください。")
             return
-        # 2. Full processing pipeline
-        self._refresh_display()
-        if not self._display_groups and not self._overflow:
-            QMessageBox.warning(self, "生成失敗", "処理後のパスが空です。設定を確認してください。")
+
+        # GCODE-only: display_groups still valid, just regenerate gcode (fast, synchronous)
+        if dirty == DirtyLevel.GCODE and self._display_groups:
+            self._regen_gcode_only()
             return
-        # 3. Generate G-code
+
+        # PIPELINE / EXTRACT: run in background thread
+        self._cancel_worker()
+        self._job_id += 1
+        job_id = self._job_id
+
+        # Snapshot everything the worker needs (thread-safe copies)
+        settings_snap  = copy.deepcopy(self.settings)
+        layers_snap    = copy.deepcopy(self._layers)
+        raw_image_path = self._raw_image_path
+        raw_view_groups = (self._raw_view.get_current_groups()
+                           if self._raw_view._is_image else [])
+        path_list_order = self._path_list.current_groups()  # ordered group refs
+
+        # Build ordered group keys for matching after deepcopy
+        ordered_colors = ([g.color for g in path_list_order]
+                          if path_list_order else None)
+
+        def task(is_cancelled, report_progress):
+            # ── 1. Image extraction ───────────────────────────────────────
+            if raw_image_path:
+                img_layer = next(
+                    (l for l in layers_snap if l['filepath'] == raw_image_path), None)
+                if img_layer is not None and not img_layer.get('groups'):
+                    report_progress("画像から輪郭を抽出中...")
+                    groups = raw_view_groups or []
+                    if not groups:
+                        from src.core.importer.image_importer import import_image
+                        safe, is_tmp = _safe_filepath(raw_image_path)
+                        try:
+                            groups = import_image(safe)
+                        finally:
+                            if is_tmp and os.path.exists(safe):
+                                try: os.remove(safe)
+                                except OSError: pass
+                    if is_cancelled():
+                        return None
+                    if img_layer is not None:
+                        img_layer['groups'] = groups
+
+            # ── 2. Collect source groups in display order ─────────────────
+            report_progress("パスを変換中...")
+            source = [g for l in layers_snap
+                      if l.get('visible', True) for g in l['groups']]
+            if not source:
+                return [], False, ""
+
+            # Re-order according to path list order (by matching color labels)
+            if ordered_colors:
+                color_to_grp = {g.color: g for g in source}
+                ordered = [color_to_grp[c] for c in ordered_colors
+                           if c in color_to_grp]
+                # append any groups not in ordered (draw layers may not be in list)
+                ordered += [g for g in source if g not in ordered]
+            else:
+                ordered = source
+
+            pa = settings_snap.path
+            fi = settings_snap.fill
+            draw_layer_ids = {
+                id(g)
+                for l in layers_snap if l.get('is_draw', False)
+                for g in l['groups']
+            }
+
+            # ── 3. Transform / fill / optimize ────────────────────────────
+            result: List[PathGroup] = []
+            for grp in ordered:
+                if is_cancelled():
+                    return None
+                if id(grp) in draw_layer_ids:
+                    new_paths = list(grp.paths)
+                else:
+                    new_paths = [p.transformed(pa.scale / 100.0, pa.offset_x,
+                                               pa.offset_y, pa.rotation)
+                                 for p in grp.paths]
+                fills = generate_fills_for_paths(new_paths, fi) if fi.enabled else []
+                if fi.layer_order == "outline_first":   combined = new_paths + fills
+                elif fi.layer_order == "fill_first":    combined = fills + new_paths
+                else:                                   combined = fills
+                if pa.optimize and combined:
+                    report_progress(f"パス最適化中: {grp.label or grp.color}...")
+                    if is_cancelled():
+                        return None
+                    combined = optimize(combined, pa.optimize_algorithm, pa.join_distance)
+                result.append(PathGroup(color=grp.color, label=grp.label, paths=combined,
+                                        pen_change_before=grp.pen_change_before))
+
+            overflow = paths_overflow([p for g in result for p in g.paths], settings_snap)
+
+            # ── 4. G-code generation ──────────────────────────────────────
+            report_progress("G-code を生成中...")
+            if is_cancelled():
+                return None
+            src_name = (os.path.basename(raw_image_path or "")
+                        or (os.path.basename(layers_snap[0]['filepath'])
+                            if layers_snap else ""))
+            gcode = generate_gcode(result, settings_snap, src_name)
+            return result, overflow, gcode
+
+        self._worker = PipelineWorker(job_id, task, self)
+        self._worker.result_ready.connect(self._on_worker_result)
+        self._worker.error_occurred.connect(self._on_worker_error)
+        self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished.connect(self._on_worker_finished)
+
+        self._progress_bar.setVisible(True)
+        self._btn_gen.setEnabled(False)
+        self._stop_pulse()
+        self._status.showMessage("処理中...", 0)
+        self._worker.start()
+
+    def _regen_gcode_only(self):
+        """Synchronously regenerate G-code from existing display_groups (fast path)."""
         try:
             src = (os.path.basename(self._source_files[0])
                    if self._source_files else "")
@@ -1007,13 +1314,59 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "生成エラー", f"G-code 生成に失敗しました:\n{e}")
             return
-        # 4. Mark Preview fresh, switch to Preview tab, stop pulse
-        self._preview_dirty = False
+        self._dirty_level = DirtyLevel.CLEAN
         self._stop_pulse()
-        self._set_view("transformed")   # ← auto-switch to Preview
+        self._set_view("transformed")
         self._update_status()
         lines = len(self._gcode_text.splitlines())
         self._status.showMessage(f"G-code 生成完了: {lines} 行", 5000)
+
+    def _cancel_worker(self):
+        """Cancel any running worker and wait briefly."""
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(800)
+
+    def _on_worker_result(self, job_id: int, groups, overflow: bool, gcode: str):
+        """Receive completed pipeline result (called on UI thread)."""
+        if job_id != self._job_id:
+            return  # stale result — discard
+        self._display_groups = groups
+        self._overflow       = overflow
+        self._gcode_text     = gcode
+        self._dirty_level    = DirtyLevel.CLEAN
+        self._update_seekbar_max()
+
+        # Sync image layer groups back (extraction may have populated them)
+        if self._raw_image_path:
+            img_layer = next(
+                (l for l in self._layers if l['filepath'] == self._raw_image_path), None)
+            if img_layer is not None and not img_layer.get('groups'):
+                # find in worker result — not directly available; mark as done
+                pass
+
+        self._path_list.set_layers(self._layers)
+        self._set_view("transformed")
+        self._update_status()
+        lines = len(gcode.splitlines()) if gcode else 0
+        self._status.showMessage(f"G-code 生成完了: {lines} 行", 5000)
+
+        if overflow:
+            QMessageBox.warning(self, "はみ出し警告",
+                                "パスが有効描画エリアをはみ出しています。\n配置を調整してください。")
+
+    def _on_worker_error(self, job_id: int, message: str):
+        if job_id != self._job_id:
+            return
+        QMessageBox.critical(self, "生成エラー", f"処理に失敗しました:\n{message}")
+        self._update_status()
+
+    def _on_worker_progress(self, message: str):
+        self._status.showMessage(message, 0)
+
+    def _on_worker_finished(self):
+        self._progress_bar.setVisible(False)
+        self._update_status()
 
     def _on_save(self):
         if not self._gcode_text:
@@ -1064,7 +1417,8 @@ class MainWindow(QMainWindow):
                 self.settings.fill    = loaded.fill
                 self.settings.gcode   = loaded.gcode
                 self._settings_panel._refresh_from_settings()
-                self._mark_preview_dirty()
+                self._prev_settings_hash = self._settings_hash()
+                self._set_dirty(DirtyLevel.PIPELINE)
                 self._status.showMessage(f"設定を読み込み: {path}", 3000)
             except Exception as e:
                 QMessageBox.critical(self, "エラー", f"読み込みに失敗しました:\n{e}")
@@ -1110,6 +1464,11 @@ class MainWindow(QMainWindow):
         self._undo_stack.blockSignals(True)
         self._undo_stack.push(cmd)
         self._undo_stack.blockSignals(False)
+
+    def closeEvent(self, event):
+        """Ensure background worker is stopped before exit."""
+        self._cancel_worker()
+        super().closeEvent(event)
 
     def _on_about(self):
         QMessageBox.about(
