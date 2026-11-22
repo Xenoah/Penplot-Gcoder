@@ -1,0 +1,37 @@
+[package]
+name = "penplot-gcoder"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Offline pen plotter workstation and G-code compiler"
+publish = false
+default-run = "penplot-studio"
+
+[lib]
+name = "penplot"
+path = "src-rs/lib.rs"
+
+[[bin]]
+name = "penplot"
+path = "src-rs/cli.rs"
+
+[[bin]]
+name = "penplot-studio"
+path = "src-rs/desktop.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+usvg = { version = "=0.45.1", default-features = false }
+image = { version = "=0.25.8", default-features = false, features = ["png", "jpeg"] }
+eframe = { version = "=0.32.3", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = { version = "=0.15.4", optional = true }
+
+[profile.release]
+strip = true

@@ -1,0 +1,2335 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
+use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke as Ink, Vec2};
+use penplot::{
+    Artwork, Fill, ImportOptions, JobOptions, Origin, Output, Point, Profile, Project,
+    ProjectLayer, Stroke,
+};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        #[cfg(target_os = "windows")]
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("Penplot-Gcoder Studio")
+            .set_description(&error)
+            .show();
+        std::process::exit(1);
+    }
+}
+
+const ACCENT: Color32 = Color32::from_rgb(96, 224, 193);
+const PAPER: Color32 = Color32::from_rgb(248, 248, 238);
+const BED: Color32 = Color32::from_rgb(186, 200, 204);
+const WARN: Color32 = Color32::from_rgb(255, 184, 108);
+const GRID: Color32 = Color32::from_rgb(226, 231, 219);
+const MAX_LAYER_COUNT: usize = 128;
+const MAX_UNDO_STATES: usize = 32;
+
+// Each edit snapshots the layer metadata, but the artwork is shared until edited.
+#[derive(Clone)]
+struct Layer {
+    name: String,
+    strokes: Arc<[Stroke]>,
+    visible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tool {
+    Pan,
+    Line,
+    Rectangle,
+    Ellipse,
+    Freehand,
+}
+
+impl Tool {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pan => "Pan",
+            Self::Line => "Line",
+            Self::Rectangle => "Box",
+            Self::Ellipse => "Ellipse",
+            Self::Freehand => "Freehand",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum Inspector {
+    Artwork,
+    Machine,
+    Route,
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    layers: Vec<Layer>,
+    options: JobOptions,
+}
+
+struct Imported {
+    name: String,
+    artwork: Artwork,
+}
+
+struct ImportReport {
+    items: Vec<Imported>,
+    notices: Vec<String>,
+}
+
+struct PlanReport {
+    revision: u64,
+    result: Result<(Vec<Stroke>, Result<Output, String>), String>,
+}
+
+struct Studio {
+    layers: Vec<Layer>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    selected: Option<usize>,
+    import_options: ImportOptions,
+    profile: Profile,
+    options: JobOptions,
+    inspector: Inspector,
+    tools: Tool,
+    frame: Camera,
+    isometric: bool,
+    z_exaggeration: f64,
+    draft: Vec<Point>,
+    notices: Vec<String>,
+    profile_notices: Vec<String>,
+    status: String,
+    error: Option<String>,
+    planned: Vec<Stroke>,
+    output: Option<Output>,
+    calibrated: bool,
+    show_travel: bool,
+    play: bool,
+    shown: usize,
+    last_tick: f64,
+    import_task: Option<mpsc::Receiver<ImportReport>>,
+    import_dialog: Option<mpsc::Receiver<Option<Vec<PathBuf>>>>,
+    last_export_dir: Option<PathBuf>,
+    project_file: Option<PathBuf>,
+    project_dirty: bool,
+    pending_open: Option<(PathBuf, Project)>,
+    confirm_quit: bool,
+    allow_quit: bool,
+    preview_dirty: bool,
+    show_gcode: bool,
+    inspection_air: Option<Output>,
+    air_first: bool,
+    revision: u64,
+    plan_task: Option<mpsc::Receiver<PlanReport>>,
+    help_open: bool,
+    japanese: bool,
+}
+
+impl Default for Studio {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            selected: None,
+            import_options: ImportOptions::default(),
+            profile: Profile::default(),
+            options: JobOptions::default(),
+            inspector: Inspector::Artwork,
+            tools: Tool::Pan,
+            frame: Camera::default(),
+            isometric: false,
+            z_exaggeration: 3.0,
+            draft: Vec::new(),
+            notices: Vec::new(),
+            profile_notices: Vec::new(),
+            status: "Import artwork or draw on the bed to begin.".into(),
+            error: None,
+            planned: Vec::new(),
+            output: None,
+            calibrated: false,
+            show_travel: true,
+            play: false,
+            shown: 0,
+            last_tick: 0.0,
+            import_task: None,
+            import_dialog: None,
+            last_export_dir: None,
+            project_file: None,
+            project_dirty: false,
+            pending_open: None,
+            confirm_quit: false,
+            allow_quit: false,
+            preview_dirty: true,
+            show_gcode: false,
+            inspection_air: None,
+            air_first: true,
+            revision: 0,
+            plan_task: None,
+            help_open: false,
+            japanese: false,
+        }
+    }
+}
+
+pub fn run() -> Result<(), String> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1240.0, 780.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_drag_and_drop(true),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Penplot-Gcoder Studio",
+        options,
+        Box::new(|cc| {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = Color32::from_rgb(26, 32, 40);
+            visuals.window_fill = Color32::from_rgb(30, 37, 45);
+            visuals.extreme_bg_color = Color32::from_rgb(15, 20, 26);
+            visuals.faint_bg_color = Color32::from_rgb(34, 44, 53);
+            visuals.selection.bg_fill = Color32::from_rgb(47, 104, 98);
+            visuals.selection.stroke = Ink::new(1.0, ACCENT);
+            cc.egui_ctx.set_visuals(visuals);
+            cc.egui_ctx.style_mut(|style| {
+                style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+                style.spacing.button_padding = egui::vec2(8.0, 4.0);
+            });
+            let japanese = install_system_font(&cc.egui_ctx);
+            Ok(Box::new(Studio {
+                japanese,
+                ..Studio::default()
+            }))
+        }),
+    )
+    .map_err(|error| format!("Could not open the desktop window: {error}"))
+}
+
+impl eframe::App for Studio {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
+impl Studio {
+    fn update_ui(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.project_dirty
+            && !self.allow_quit
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_quit = true;
+        }
+        self.take_file_selection(ctx);
+        self.poll_import();
+        self.shortcuts(ctx);
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.draft.clear();
+        }
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let paths = dropped.into_iter().filter_map(|file| file.path).collect();
+            self.begin_import(ctx, paths);
+        }
+        self.poll_plan(ctx);
+        self.step_player(ctx);
+        egui::TopBottomPanel::top("header").show(ctx, |ui| self.header(ui, ctx));
+        egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| self.timeline(ui));
+        egui::SidePanel::left("inspector")
+            .default_width(294.0)
+            .width_range(245.0..=370.0)
+            .show(ctx, |ui| self.inspector(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.canvas(ui));
+        self.gcode_window(ctx);
+        self.help_window(ctx);
+        self.confirm_project_actions(ctx);
+        if self.preview_dirty && self.plan_task.is_none() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl Studio {
+    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("PENPLOT").strong().color(ACCENT));
+            ui.label(RichText::new("STUDIO  /  RUST").small().weak());
+            ui.separator();
+            let busy = self.import_task.is_some() || self.import_dialog.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Import…"))
+                .clicked()
+            {
+                self.select_files(ctx);
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.menu_button("Project", |ui| {
+                    if ui.button("Open project…").clicked() {
+                        ui.close();
+                        self.open_project_dialog();
+                    }
+                    if ui.button("Save project…").clicked() {
+                        ui.close();
+                        self.save_project_dialog();
+                    }
+                });
+            });
+            if self.project_dirty {
+                ui.label(RichText::new("Unsaved").small().color(WARN));
+            }
+            if busy {
+                ui.spinner();
+            }
+            if ui
+                .add_enabled(!busy && !self.undo.is_empty(), egui::Button::new("Undo"))
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(!busy && !self.redo.is_empty(), egui::Button::new("Redo"))
+                .clicked()
+            {
+                self.redo();
+            }
+            if ui
+                .button(if self.japanese { "使い方" } else { "Help" })
+                .clicked()
+            {
+                self.help_open = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let enabled = self.can_export();
+                let title = if self.air_first {
+                    "Export air run…"
+                } else {
+                    "Export G-code…"
+                };
+                if ui
+                    .add_enabled(enabled, egui::Button::new(title))
+                    .on_disabled_hover_text(
+                        "Plan a valid job and confirm the measured setup on the Machine tab.",
+                    )
+                    .clicked()
+                {
+                    self.save_gcode(self.air_first);
+                }
+                if ui
+                    .checkbox(&mut self.air_first, "Air run first")
+                    .on_hover_text("Air run follows the same XY route but never lowers the pen.")
+                    .changed()
+                {
+                    self.show_gcode = false;
+                    self.inspection_air = None;
+                }
+                if ui
+                    .add_enabled(
+                        self.output.is_some() && !self.preview_dirty,
+                        egui::Button::new("Inspect G-code"),
+                    )
+                    .clicked()
+                {
+                    if self.air_first {
+                        match penplot::generate_air_run(&self.planned, &self.profile) {
+                            Ok(output) => self.inspection_air = Some(output),
+                            Err(error) => {
+                                self.status = error;
+                                return;
+                            }
+                        }
+                    }
+                    self.show_gcode = true;
+                }
+            });
+        });
+        ui.add_space(5.0);
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let shortcuts = ctx.input(|i| {
+            let has = |key| i.modifiers.command && i.key_pressed(key);
+            (
+                has(Key::O),
+                has(Key::Z),
+                has(Key::Y),
+                i.modifiers.shift,
+                has(Key::S),
+            )
+        });
+        if shortcuts.0 {
+            if shortcuts.3 {
+                self.open_project_dialog();
+            } else {
+                self.select_files(ctx);
+            }
+        }
+        if shortcuts.4 {
+            self.save_project_dialog();
+        }
+        if !ctx.wants_keyboard_input() {
+            if shortcuts.2 || (shortcuts.1 && shortcuts.3) {
+                self.redo();
+            } else if shortcuts.1 {
+                self.undo();
+            }
+        }
+    }
+
+    fn select_files(&mut self, ctx: &egui::Context) {
+        if self.import_task.is_some() || self.import_dialog.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        // Windows and Linux dialogs can be driven by a worker. Cocoa needs the main thread.
+        #[cfg(not(target_os = "macos"))]
+        std::thread::spawn(move || {
+            let _ = sender.send(artwork_dialog());
+            ctx.request_repaint();
+        });
+        #[cfg(target_os = "macos")]
+        {
+            let _ = sender.send(artwork_dialog());
+            ctx.request_repaint();
+        }
+        self.import_dialog = Some(receiver);
+    }
+
+    fn begin_import(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.import_task.is_some() {
+            self.status = "An import is already in progress; try again when it finishes.".into();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        let options = self.import_options.clone();
+        let available = MAX_LAYER_COUNT.saturating_sub(self.layers.len());
+        let (mut paths_used, mut points_used) = self.geometry_size();
+        self.status = "Reading and tracing artwork…".into();
+        std::thread::spawn(move || {
+            let mut notices = Vec::new();
+            if paths.len() > available {
+                notices.push(format!(
+                    "Layer limit: {} of {} selected files can be imported.",
+                    available,
+                    paths.len()
+                ));
+            }
+            let items = paths
+                .iter()
+                .take(available)
+                .filter_map(|path| match import_one(path, &options) {
+                    Ok(item) => {
+                        let strokes = item.artwork.strokes.len();
+                        let vertices = item.artwork.strokes.iter().map(|s| s.points.len()).sum::<usize>();
+                        if paths_used + strokes > penplot::MAX_STROKES || points_used + vertices > penplot::MAX_POINTS {
+                            notices.push(format!("{}: workspace geometry limit reached; remove other layers before retrying.", item.name));
+                            None
+                        } else {
+                            paths_used += strokes;
+                            points_used += vertices;
+                            Some(item)
+                        }
+                    }
+                    Err(message) => {
+                        notices.push(message);
+                        None
+                    }
+                })
+                .collect();
+            let _ = sender.send(ImportReport { items, notices });
+            ctx.request_repaint();
+        });
+        self.import_task = Some(receiver);
+    }
+
+    fn poll_import(&mut self) {
+        if let Some(task) = &self.import_task {
+            match task.try_recv() {
+                Ok(result) => {
+                    self.import_task = None;
+                    self.notices = result.notices;
+                    if result.items.is_empty() {
+                        self.status = "No artwork imported. See the notes in Artwork.".into();
+                        self.inspector = Inspector::Artwork;
+                        return;
+                    }
+                    self.record_layers();
+                    let count = result.items.len();
+                    for imported in result.items {
+                        self.notices.extend(imported.artwork.warnings);
+                        self.layers.push(Layer {
+                            name: imported.name,
+                            strokes: imported.artwork.strokes.into(),
+                            visible: true,
+                        });
+                    }
+                    self.selected = Some(self.layers.len() - 1);
+                    self.status =
+                        format!("{count} layer(s) imported. Check placement before export.");
+                    self.inspector = Inspector::Artwork;
+                    self.invalidate();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.import_task = None;
+                    self.status = "The artwork importer stopped before returning a result.".into();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn take_file_selection(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.import_dialog else {
+            return;
+        };
+        match dialog.try_recv() {
+            Ok(selection) => {
+                self.import_dialog = None;
+                if let Some(paths) = selection {
+                    self.begin_import(ctx, paths);
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.import_dialog = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            layers: self.layers.clone(),
+            options: self.options.clone(),
+        }
+    }
+
+    fn geometry_size(&self) -> (usize, usize) {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.strokes.iter())
+            .fold((0, 0), |(paths, vertices), stroke| {
+                (paths + 1, vertices + stroke.points.len())
+            })
+    }
+
+    fn record_layers(&mut self) {
+        if self.undo.len() >= MAX_UNDO_STATES {
+            self.undo.remove(0);
+        }
+        self.undo.push(self.snapshot());
+        self.redo.clear();
+    }
+
+    fn undo(&mut self) {
+        if self.import_task.is_some() {
+            return;
+        }
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.layers = previous.layers;
+            self.options = previous.options;
+            self.selected = None;
+            self.invalidate();
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.import_task.is_some() {
+            return;
+        }
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.layers = next.layers;
+            self.options = next.options;
+            self.selected = None;
+            self.invalidate();
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.preview_dirty = true;
+        self.project_dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+        self.output = None;
+        self.inspection_air = None;
+        self.show_gcode = false;
+        self.planned.clear();
+        self.shown = 0;
+        self.error = None;
+        self.play = false;
+    }
+
+    fn step_player(&mut self, ctx: &egui::Context) {
+        if !self.play {
+            return;
+        }
+        let now = ctx.input(|input| input.time);
+        if now - self.last_tick >= 0.085 {
+            self.shown = (self.shown + 1).min(self.planned.len());
+            self.last_tick = now;
+            self.play = self.shown < self.planned.len();
+        }
+        if self.play {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn timeline(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let count = self.planned.len();
+            if ui.add_enabled(count != 0, egui::Button::new(if self.play { "Pause" } else { "Play" })).clicked() {
+                if self.shown >= count {
+                    self.shown = 0;
+                }
+                self.play = !self.play;
+                ui.ctx().request_repaint();
+            }
+            ui.add_enabled(count != 0, egui::Slider::new(&mut self.shown, 0..=count).text("strokes"));
+            ui.checkbox(&mut self.show_travel, "Show travel")
+                .on_hover_text("Pen-up moves between strokes. The initial carriage position is not simulated.");
+            ui.separator();
+            if let Some(output) = &self.output {
+                ui.label(format!(
+                    "{:.1} mm draw   /   {:.1} mm travel   /   ~{:.0} s",
+                    output.draw_mm, output.travel_mm, output.seconds
+                )).on_hover_text("Motion estimate; actual firmware acceleration and starting position affect print time.");
+            } else if self.plan_task.is_some() {
+                ui.spinner();
+                ui.label(RichText::new("Planning current route…").weak());
+            } else {
+                ui.label(RichText::new("No exportable route").weak());
+            }
+        });
+        if let Some(error) = &self.error {
+            ui.colored_label(WARN, error);
+        } else {
+            ui.label(RichText::new(&self.status).weak());
+        }
+        ui.add_space(4.0);
+    }
+
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.inspector, Inspector::Artwork, "Artwork");
+            ui.selectable_value(&mut self.inspector, Inspector::Machine, "Machine");
+            ui.selectable_value(&mut self.inspector, Inspector::Route, "Route");
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("inspector_scroll", self.inspector))
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.inspector {
+                Inspector::Artwork => self.artwork_panel(ui),
+                Inspector::Machine => self.machine_panel(ui),
+                Inspector::Route => self.route_panel(ui),
+            });
+    }
+
+    fn artwork_panel(&mut self, ui: &mut egui::Ui) {
+        section(ui, "LAYERS");
+        if self.layers.is_empty() {
+            ui.label(RichText::new("Drop SVG, DXF, PNG or JPEG files here.").weak());
+        }
+        let mut action = None;
+        for (index, layer) in self.layers.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let mut visible = layer.visible;
+                if ui
+                    .checkbox(&mut visible, "")
+                    .on_hover_text("Include in drawing")
+                    .changed()
+                {
+                    action = Some((index, LayerAction::Visibility(visible)));
+                }
+                let label = format!("{}  ·  {}", layer.name, layer.strokes.len());
+                if ui
+                    .selectable_label(self.selected == Some(index), label)
+                    .clicked()
+                {
+                    self.selected = Some(index);
+                }
+            });
+        }
+        if let Some(index) = self.selected.filter(|&index| index < self.layers.len()) {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("Move up"))
+                    .clicked()
+                {
+                    action = Some((index, LayerAction::Move(index - 1)));
+                }
+                if ui
+                    .add_enabled(
+                        index + 1 < self.layers.len(),
+                        egui::Button::new("Move down"),
+                    )
+                    .clicked()
+                {
+                    action = Some((index, LayerAction::Move(index + 1)));
+                }
+                if ui.button("Remove").clicked() {
+                    action = Some((index, LayerAction::Delete));
+                }
+            });
+        }
+        if let Some((index, action)) = action {
+            self.record_layers();
+            match action {
+                LayerAction::Visibility(value) => self.layers[index].visible = value,
+                LayerAction::Move(target) => {
+                    self.layers.swap(index, target);
+                    self.selected = Some(target);
+                }
+                LayerAction::Delete => {
+                    self.layers.remove(index);
+                    self.selected = None;
+                }
+            }
+            self.invalidate();
+        }
+        ui.separator();
+        self.placement_panel(ui);
+        ui.separator();
+        self.import_panel(ui);
+        if !self.notices.is_empty() {
+            ui.separator();
+            section(ui, "IMPORT NOTES");
+            for notice in &self.notices {
+                ui.colored_label(WARN, notice);
+            }
+        }
+    }
+
+    fn open_project_dialog(&mut self) {
+        if self.import_dialog.is_some() || self.import_task.is_some() || self.pending_open.is_some()
+        {
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new().add_filter("Penplot project", &["penplot"]);
+        if let Some(directory) = self.project_file.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(path) = dialog.pick_file() {
+            match penplot::read_limited(&path).and_then(|bytes| Project::from_json(&bytes)) {
+                Ok(project) if self.project_dirty => self.pending_open = Some((path, project)),
+                Ok(project) => self.apply_project(path, project),
+                Err(error) => self.status = format!("Unable to open project: {error}"),
+            }
+        }
+    }
+
+    fn save_project_dialog(&mut self) {
+        if self.import_dialog.is_some() || self.import_task.is_some() {
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new().add_filter("Penplot project", &["penplot"]);
+        if let Some(existing) = self.project_file.as_deref() {
+            if let Some(directory) = existing.parent() {
+                dialog = dialog.set_directory(directory);
+            }
+            dialog =
+                dialog.set_file_name(existing.file_name().unwrap_or_default().to_string_lossy());
+        } else {
+            dialog = dialog.set_file_name("drawing.penplot");
+        }
+        if let Some(mut path) = dialog.save_file() {
+            let overwrite_confirmed = path.extension().is_some();
+            if !overwrite_confirmed {
+                path.set_extension("penplot");
+            }
+            let result = self
+                .as_project()
+                .to_json()
+                .and_then(|bytes| penplot::save_file(&path, &bytes, overwrite_confirmed));
+            self.status = match result {
+                Ok(()) => {
+                    self.project_dirty = false;
+                    let status = format!("Saved project to {}.", path.display());
+                    self.project_file = Some(path);
+                    status
+                }
+                Err(error) => format!("Unable to save project: {error}"),
+            };
+        }
+    }
+
+    fn as_project(&self) -> Project {
+        Project {
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| ProjectLayer {
+                    name: layer.name.clone(),
+                    visible: layer.visible,
+                    strokes: layer.strokes.to_vec(),
+                })
+                .collect(),
+            options: self.options.clone(),
+            profile: self.profile.clone(),
+            import_options: self.import_options.clone(),
+        }
+    }
+
+    fn apply_project(&mut self, path: PathBuf, project: Project) {
+        self.layers = project
+            .layers
+            .into_iter()
+            .map(|layer| Layer {
+                name: layer.name,
+                visible: layer.visible,
+                strokes: layer.strokes.into(),
+            })
+            .collect();
+        self.options = project.options;
+        self.profile = project.profile;
+        self.import_options = project.import_options;
+        self.frame = Camera::default();
+        self.isometric = false;
+        self.tools = Tool::Pan;
+        self.draft.clear();
+        self.notices.clear();
+        self.profile_notices.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.selected = None;
+        self.calibrated = false;
+        self.air_first = true;
+        self.show_gcode = false;
+        self.inspector = Inspector::Artwork;
+        self.status = format!(
+            "Opened {}. Reconfirm the measured setup before export.",
+            path.display()
+        );
+        self.project_file = Some(path);
+        self.invalidate();
+        self.project_dirty = false;
+    }
+
+    fn confirm_project_actions(&mut self, ctx: &egui::Context) {
+        if let Some((path, _)) = &self.pending_open {
+            let mut discard = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("project_replace")).show(ctx, |ui| {
+                ui.heading("Replace this workspace?");
+                ui.label(format!(
+                    "Opening {} will discard unsaved changes.",
+                    path.display()
+                ));
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Keep working").clicked();
+                    discard = ui.button("Discard and open").clicked();
+                });
+            });
+            if discard {
+                if let Some((path, project)) = self.pending_open.take() {
+                    self.apply_project(path, project);
+                }
+            } else if cancel || modal.should_close() {
+                self.pending_open = None;
+            }
+        }
+        if self.confirm_quit {
+            let mut discard = false;
+            let mut cancel = false;
+            let modal = egui::Modal::new(egui::Id::new("project_quit")).show(ctx, |ui| {
+                ui.heading("Close without saving?");
+                ui.label("Save the current workspace first if you want to keep it.");
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Keep working").clicked();
+                    discard = ui.button("Discard and close").clicked();
+                });
+            });
+            if discard {
+                self.confirm_quit = false;
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if cancel || modal.should_close() {
+                self.confirm_quit = false;
+            }
+        }
+    }
+
+    fn help_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new(if self.japanese { "使い方 / Quick start" } else { "Quick start" })
+            .open(&mut self.help_open)
+            .resizable(false)
+            .max_width(520.0)
+            .show(ctx, |ui| {
+                if self.japanese {
+                    ui.label("1. Import で図面を読み込みます。Fit to usable bed で描画範囲に収めます。");
+                    ui.label("2. Machine で実測した Z・オフセット・可動範囲を設定し、確認欄にチェックします。");
+                    ui.label("3. 機械側でペンを逃がして原点復帰し、まず Air run（ペン上げのみ）で干渉を確認します。");
+                    ui.label("4. 問題なければ Air run first を外して描画用 G-code を出力します。");
+                } else {
+                    ui.label("1. Import your drawing and use Fit to usable bed if needed.");
+                    ui.label("2. Set and confirm measured Z, offsets and travel limits in Machine.");
+                    ui.label("3. Home manually with clearance; export and verify a pen-up air run.");
+                    ui.label("4. Uncheck Air run first only when ready to export the drawing file.");
+                }
+                ui.separator();
+                ui.small("This app exports files only. It does not connect to or control the printer.");
+            });
+    }
+
+    fn gcode_window(&mut self, ctx: &egui::Context) {
+        if !self.show_gcode {
+            return;
+        }
+        egui::Window::new(if self.air_first {
+            "Air-run G-code"
+        } else {
+            "Drawing G-code"
+        })
+        .open(&mut self.show_gcode)
+        .default_width(600.0)
+        .default_height(400.0)
+        .show(ctx, |ui| {
+            let result = if self.air_first {
+                &self.inspection_air
+            } else {
+                &self.output
+            };
+            let Some(result) = result else {
+                ui.label("The current route has no valid G-code.");
+                return;
+            };
+            if ui
+                .add_enabled(self.calibrated, egui::Button::new("Copy entire file"))
+                .clicked()
+            {
+                ui.ctx().copy_text(result.gcode.clone());
+            }
+            let mut end = result.gcode.len().min(48_000);
+            while !result.gcode.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut snippet = &result.gcode[..end];
+            if end != result.gcode.len() {
+                ui.small(
+                    "Preview limited to the first 48 KB. Copy and export preserve the full file.",
+                );
+            }
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut snippet)
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        });
+    }
+
+    fn save_gcode(&mut self, air_run: bool) {
+        if !self.can_export() {
+            return;
+        }
+        let Some(output) = self
+            .output
+            .as_ref()
+            .filter(|_| self.calibrated && !self.preview_dirty)
+        else {
+            return;
+        };
+        let air;
+        let output = if air_run {
+            match penplot::generate_air_run(&self.planned, &self.profile) {
+                Ok(output) => {
+                    air = output;
+                    &air
+                }
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            }
+        } else {
+            output
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("G-code", &["GCODE", "gcode"])
+            .set_file_name(if air_run {
+                "AIRRUN.GCODE"
+            } else {
+                "PLOT.GCODE"
+            });
+        if let Some(directory) = self.last_export_dir.as_deref() {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(mut path) = dialog.save_file() {
+            let overwrite_confirmed_by_dialog = path.extension().is_some();
+            if !overwrite_confirmed_by_dialog {
+                path.set_extension("GCODE");
+            }
+            match penplot::save_file(
+                &path,
+                output.gcode.as_bytes(),
+                overwrite_confirmed_by_dialog,
+            ) {
+                Ok(()) => {
+                    self.last_export_dir = path.parent().map(Path::to_path_buf);
+                    self.status = if air_run {
+                        format!(
+                            "Exported {} with the pen up only. Verify clearance at the machine.",
+                            path.display()
+                        )
+                    } else {
+                        format!(
+                            "Exported {}. Run an air plot before making contact.",
+                            path.display()
+                        )
+                    };
+                }
+                Err(error) => self.status = format!("Unable to save {}: {error}", path.display()),
+            }
+        }
+    }
+}
+
+enum LayerAction {
+    Visibility(bool),
+    Move(usize),
+    Delete,
+}
+
+fn section(ui: &mut egui::Ui, label: &str) {
+    ui.label(RichText::new(label).small().strong().color(ACCENT));
+}
+
+fn install_system_font(ctx: &egui::Context) -> bool {
+    #[cfg(target_os = "windows")]
+    let paths = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .map(|dir| dir.join("Fonts"))
+        .filter(|dir| dir.is_absolute())
+        .into_iter()
+        .flat_map(|dir| {
+            [
+                dir.join("meiryo.ttc"),
+                dir.join("YuGothM.ttc"),
+                dir.join("msgothic.ttc"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    let paths = [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    ]
+    .map(PathBuf::from);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    ]
+    .map(PathBuf::from);
+    for path in paths {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut data = Vec::new();
+        if file
+            .take(32 * 1024 * 1024 + 1)
+            .read_to_end(&mut data)
+            .is_err()
+            || data.len() > 32 * 1024 * 1024
+            || !matches!(data.get(..4), Some(b"ttcf" | b"OTTO" | b"\x00\x01\x00\x00"))
+        {
+            continue;
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        let name = "system-cjk".to_owned();
+        fonts
+            .font_data
+            .insert(name.clone(), Arc::new(egui::FontData::from_owned(data)));
+        for names in fonts.families.values_mut() {
+            names.push(name.clone());
+        }
+        ctx.set_fonts(fonts);
+        return true;
+    }
+    false
+}
+
+fn artwork_dialog() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .add_filter("Plot artwork", &["svg", "dxf", "png", "jpg", "jpeg"])
+        .pick_files()
+}
+
+fn import_one(path: &Path, options: &ImportOptions) -> Result<Imported, String> {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let bytes = penplot::read_limited(path).map_err(|error| format!("{name}: {error}"))?;
+    let mut artwork = penplot::import_bytes(&name, &bytes, options)
+        .map_err(|error| format!("{name}: {error}"))?;
+    for warning in &mut artwork.warnings {
+        *warning = format!("{name}: {warning}");
+    }
+    if artwork.strokes.is_empty() {
+        return Err(format!("{name}: no plottable strokes were imported."));
+    }
+    Ok(Imported { name, artwork })
+}
+
+struct Camera {
+    zoom: f32,
+    shift: Vec2,
+}
+
+impl Studio {
+    fn placement_panel(&mut self, ui: &mut egui::Ui) {
+        section(ui, "PLACEMENT · MM");
+        let mut draft = self.options.clone();
+        let mut changed = number(ui, "Scale factor", &mut draft.scale, 0.01);
+        changed |= number(ui, "Rotation (deg)", &mut draft.rotation_deg, 0.5);
+        changed |= number(ui, "Left X", &mut draft.x, 0.1);
+        changed |= number(ui, "Bottom Y", &mut draft.y, 0.1);
+        if ui
+            .add_enabled(
+                self.layers.iter().any(|layer| layer.visible),
+                egui::Button::new("Fit to usable bed"),
+            )
+            .on_hover_text("Fit the combined visible artwork with a 5 mm border.")
+            .clicked()
+        {
+            match self
+                .combined()
+                .and_then(|strokes| penplot::fit(&strokes, &self.profile, &mut draft, 5.0))
+            {
+                Ok(()) => {
+                    changed = true;
+                    self.status = "Artwork fitted to the usable bed.".into();
+                }
+                Err(error) => self.status = error,
+            }
+        }
+        if changed {
+            self.record_layers();
+            self.options = draft;
+            self.invalidate();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn import_panel(&mut self, ui: &mut egui::Ui) {
+        let before = self.import_options.clone();
+        section(ui, "IMPORT SETTINGS");
+        ui.small("Applies to files imported next.");
+        number(
+            ui,
+            "Curve tolerance (mm)",
+            &mut self.import_options.tolerance,
+            0.01,
+        );
+        number(ui, "Raster DPI", &mut self.import_options.dpi, 1.0);
+        ui.horizontal(|ui| {
+            ui.label("Raster threshold");
+            ui.add(egui::DragValue::new(&mut self.import_options.threshold).speed(1));
+        });
+        ui.checkbox(
+            &mut self.import_options.invert,
+            "Trace light instead of dark",
+        );
+        if before != self.import_options {
+            self.project_dirty = true;
+        }
+    }
+
+    fn machine_panel(&mut self, ui: &mut egui::Ui) {
+        section(ui, "MACHINE PROFILE");
+        ui.label(RichText::new(&self.profile.name).strong());
+        ui.horizontal(|ui| {
+            if ui.button("Load JSON…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Profile", &["json"])
+                    .pick_file()
+            {
+                self.load_profile(&path);
+            }
+            if ui.button("Save JSON…").clicked() {
+                self.save_profile();
+            }
+            if ui.button("Use K9").clicked() {
+                self.profile = Profile::k9();
+                self.profile_notices.clear();
+                self.calibrated = false;
+                self.status =
+                    "Loaded K9 starting values. Measure your machine before export.".into();
+                self.invalidate();
+                ui.ctx().request_repaint();
+            }
+        });
+        ui.add_space(4.0);
+        let profile = &mut self.profile;
+        let mut changed = ui.text_edit_singleline(&mut profile.name).changed();
+        changed |= number(ui, "Bed X (mm)", &mut profile.bed_x, 0.5);
+        changed |= number(ui, "Bed Y (mm)", &mut profile.bed_y, 0.5);
+        changed |= number(ui, "Maximum Z (mm)", &mut profile.max_z, 0.1);
+        egui::ComboBox::from_id_salt("origin")
+            .selected_text(match profile.origin {
+                Origin::LeftBottom => "Front left",
+                Origin::Center => "Center",
+            })
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut profile.origin, Origin::LeftBottom, "Front left")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut profile.origin, Origin::Center, "Center")
+                    .changed();
+            });
+        changed |= number(ui, "Command offset X (mm)", &mut profile.offset_x, 0.1);
+        changed |= number(ui, "Command offset Y (mm)", &mut profile.offset_y, 0.1);
+        changed |= number(ui, "Command offset Z (mm)", &mut profile.offset_z, 0.1);
+        ui.separator();
+        section(ui, "PEN & SPEED");
+        changed |= number(ui, "Pen up Z (mm)", &mut profile.pen_up_z, 0.1);
+        changed |= number(ui, "Pen down Z (mm)", &mut profile.pen_down_z, 0.1);
+        changed |= number(ui, "Pen up (mm/s)", &mut profile.pen_up_speed, 0.1);
+        changed |= number(ui, "Pen down (mm/s)", &mut profile.pen_down_speed, 0.1);
+        changed |= number(ui, "Draw (mm/s)", &mut profile.draw_speed, 0.5);
+        changed |= number(ui, "Travel (mm/s)", &mut profile.travel_speed, 0.5);
+        ui.horizontal(|ui| {
+            ui.label("After pen down (ms)");
+            changed |= ui
+                .add(egui::DragValue::new(&mut profile.touchdown_delay).speed(5))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Before pen up (ms)");
+            changed |= ui
+                .add(egui::DragValue::new(&mut profile.liftup_delay).speed(5))
+                .changed();
+        });
+        if changed {
+            self.calibrated = false;
+            self.invalidate();
+            ui.ctx().request_repaint();
+        }
+        ui.separator();
+        section(ui, "BEFORE EXPORT");
+        ui.label("Measure Z contact, Z clearance, offsets and travel limits. Home at the printer with the pen clear; the file does not home.");
+        ui.add_enabled(
+            !changed && self.profile.validate().is_ok(),
+            egui::Checkbox::new(
+                &mut self.calibrated,
+                "I verified the profile against this machine.",
+            ),
+        );
+        ui.small("Export an air run first. Check the whole route before plotting with the pen in contact.");
+        if !self.profile_notices.is_empty() {
+            ui.separator();
+            section(ui, "PROFILE NOTES");
+            for notice in &self.profile_notices {
+                ui.colored_label(WARN, notice);
+            }
+        }
+    }
+
+    fn load_profile(&mut self, path: &Path) {
+        match penplot::read_limited(path)
+            .and_then(|data| String::from_utf8(data).map_err(|error| error.to_string()))
+            .and_then(|text| Profile::from_json(&text))
+        {
+            Ok((profile, notices)) => {
+                self.profile = profile;
+                self.calibrated = false;
+                self.profile_notices = notices;
+                self.status =
+                    "Profile loaded. Reconfirm the measured setup before exporting.".into();
+                self.invalidate();
+            }
+            Err(error) => self.status = format!("Unable to load {}: {error}", path.display()),
+        }
+    }
+
+    fn save_profile(&mut self) {
+        if let Err(error) = self.profile.validate() {
+            self.status = format!("Profile is invalid: {error}");
+            return;
+        }
+        if let Some(mut path) = rfd::FileDialog::new()
+            .add_filter("Profile", &["json"])
+            .set_file_name("plotter.json")
+            .save_file()
+        {
+            let overwrite_confirmed_by_dialog = path.extension().is_some();
+            if !overwrite_confirmed_by_dialog {
+                path.set_extension("json");
+            }
+            let result = serde_json::to_vec_pretty(&self.profile)
+                .map_err(|error| error.to_string())
+                .and_then(|data| penplot::save_file(&path, &data, overwrite_confirmed_by_dialog));
+            self.status = match result {
+                Ok(()) => format!("Saved profile to {}.", path.display()),
+                Err(error) => format!("Unable to save {}: {error}", path.display()),
+            };
+        }
+    }
+
+    fn route_panel(&mut self, ui: &mut egui::Ui) {
+        section(ui, "PATH PLANNING");
+        let mut draft = self.options.clone();
+        let mut changed = ui
+            .checkbox(&mut draft.optimize, "Reduce pen-up travel")
+            .changed();
+        let label = match draft.fill {
+            Fill::None => "Outlines only",
+            Fill::Lines => "Hatch lines",
+            Fill::Cross => "Cross-hatch",
+        };
+        egui::ComboBox::from_id_salt("fill")
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(&mut draft.fill, Fill::None, "Outlines only")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut draft.fill, Fill::Lines, "Hatch lines")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut draft.fill, Fill::Cross, "Cross-hatch")
+                    .changed();
+            });
+        if draft.fill != Fill::None {
+            changed |= number(ui, "Spacing (mm)", &mut draft.hatch_spacing, 0.1);
+            changed |= number(ui, "Angle (deg)", &mut draft.hatch_angle, 1.0);
+            ui.small("Hatching applies to closed, filled shapes.");
+        }
+        if changed {
+            self.record_layers();
+            self.options = draft;
+            self.invalidate();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn combined(&self) -> Result<Vec<Stroke>, String> {
+        combine(&self.layers)
+    }
+
+    fn can_export(&self) -> bool {
+        self.output.is_some()
+            && self.calibrated
+            && !self.preview_dirty
+            && self.import_dialog.is_none()
+            && self.import_task.is_none()
+    }
+
+    fn poll_plan(&mut self, ctx: &egui::Context) {
+        if let Some(task) = &self.plan_task {
+            match task.try_recv() {
+                Ok(report) => {
+                    self.plan_task = None;
+                    if report.revision == self.revision {
+                        self.update_preview(report);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.plan_task = None;
+                    self.error =
+                        Some("The planner stopped unexpectedly. Edit the job to retry.".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !self.preview_dirty || self.plan_task.is_some() {
+            return;
+        }
+        self.preview_dirty = false;
+        if !self.layers.iter().any(|layer| layer.visible) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        let snapshot = self.snapshot();
+        let profile = self.profile.clone();
+        let revision = self.revision;
+        std::thread::spawn(move || {
+            let report = calculate_plan(revision, &snapshot, &profile);
+            let _ = sender.send(report);
+            ctx.request_repaint();
+        });
+        self.plan_task = Some(receiver);
+    }
+
+    fn update_preview(&mut self, report: PlanReport) {
+        self.error = None;
+        match report.result {
+            Ok((planned, output)) => {
+                self.planned = planned;
+                self.shown = self.planned.len();
+                match output {
+                    Ok(output) => self.output = Some(output),
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    #[cfg(test)]
+    fn rebuild(&mut self) {
+        self.preview_dirty = false;
+        let report = calculate_plan(self.revision, &self.snapshot(), &self.profile);
+        self.update_preview(report);
+    }
+}
+
+fn combine(layers: &[Layer]) -> Result<Vec<Stroke>, String> {
+    let mut all = Vec::new();
+    for (index, layer) in layers.iter().enumerate().filter(|(_, layer)| layer.visible) {
+        penplot::append_layer(&mut all, &layer.strokes, index)?;
+    }
+    Ok(all)
+}
+
+fn calculate_plan(revision: u64, snapshot: &Snapshot, profile: &Profile) -> PlanReport {
+    let result = combine(&snapshot.layers).and_then(|strokes| {
+        let planned = penplot::plan(&strokes, &snapshot.options)?;
+        let output = penplot::generate(&planned, profile);
+        Ok((planned, output))
+    });
+    PlanReport { revision, result }
+}
+
+fn number(ui: &mut egui::Ui, label: &str, field: &mut f64, speed: f64) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::DragValue::new(field).speed(speed).max_decimals(4))
+                .changed()
+        })
+        .inner
+    })
+    .inner
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            shift: Vec2::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CanvasMap {
+    anchor: Pos2,
+    scale: f32,
+}
+
+impl CanvasMap {
+    fn screen(self, p: Point) -> Pos2 {
+        self.anchor + egui::vec2(p.x as f32 * self.scale, -(p.y as f32) * self.scale)
+    }
+
+    fn paper(self, p: Pos2) -> Point {
+        let delta = (p - self.anchor) / self.scale;
+        Point::new(f64::from(delta.x), -f64::from(delta.y))
+    }
+
+    fn rect(self, area: (f64, f64, f64, f64)) -> Rect {
+        Rect::from_two_pos(
+            self.screen(Point::new(area.0, area.1)),
+            self.screen(Point::new(area.2, area.3)),
+        )
+    }
+}
+
+impl Studio {
+    fn canvas(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.isometric, false, "2D");
+            ui.selectable_value(&mut self.isometric, true, "3D lifts");
+            ui.separator();
+            if self.isometric {
+                ui.label("Z exaggeration");
+                ui.add(
+                    egui::DragValue::new(&mut self.z_exaggeration)
+                        .range(1.0..=12.0)
+                        .speed(0.1)
+                        .suffix("×"),
+                );
+                ui.label(RichText::new("Drawing simulation · not collision checked").weak());
+                return;
+            }
+            for tool in [
+                Tool::Pan,
+                Tool::Line,
+                Tool::Rectangle,
+                Tool::Ellipse,
+                Tool::Freehand,
+            ] {
+                if ui
+                    .selectable_label(self.tools == tool, tool.label())
+                    .clicked()
+                {
+                    self.tools = tool;
+                    self.draft.clear();
+                }
+            }
+            ui.separator();
+            if ui.button("Reset view").clicked() {
+                self.frame = Camera::default();
+            }
+            ui.label(RichText::new("Wheel: zoom   ·   Middle drag: pan").weak());
+        });
+        if self.isometric {
+            self.draft.clear();
+            self.isometric_canvas(ui);
+            return;
+        }
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::drag());
+        let base = response.rect;
+        let bed_x = if (0.001..=10_000.0).contains(&self.profile.bed_x) {
+            self.profile.bed_x
+        } else {
+            100.0
+        };
+        let bed_y = if (0.001..=10_000.0).contains(&self.profile.bed_y) {
+            self.profile.bed_y
+        } else {
+            100.0
+        };
+        let fit = ((base.width() - 68.0).max(20.0) / bed_x as f32)
+            .min((base.height() - 64.0).max(20.0) / bed_y as f32);
+        let camera_map = |camera: &Camera| {
+            let scale = fit * camera.zoom;
+            let offset = egui::vec2(-bed_x as f32, bed_y as f32) * (scale * 0.5);
+            CanvasMap {
+                anchor: base.center() + offset + camera.shift,
+                scale,
+            }
+        };
+        if let Some(pointer) = response.hover_pos() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let before = camera_map(&self.frame).paper(pointer);
+                self.frame.zoom = (self.frame.zoom * (scroll / 450.0).exp()).clamp(0.25, 32.0);
+                let after = camera_map(&self.frame).screen(before);
+                self.frame.shift += pointer - after;
+            }
+        }
+        let panning = response.dragged_by(egui::PointerButton::Middle)
+            || (self.tools == Tool::Pan && response.dragged_by(egui::PointerButton::Primary));
+        if panning {
+            self.frame.shift += response.drag_delta();
+        }
+        let map = camera_map(&self.frame);
+        let painter = painter.with_clip_rect(base);
+        let paper_rect = map.rect((0.0, 0.0, bed_x, bed_y));
+        painter.rect_filled(base, 7.0, Color32::from_rgb(15, 21, 27));
+        painter.rect_filled(paper_rect, 0.0, PAPER);
+        self.grid(&painter, map, bed_x, bed_y);
+        painter.rect_stroke(
+            paper_rect,
+            0.0,
+            Ink::new(1.5, BED),
+            egui::StrokeKind::Outside,
+        );
+        let area = self.profile.effective_area();
+        if [area.0, area.1, area.2, area.3]
+            .into_iter()
+            .all(f64::is_finite)
+            && area.0 < area.2
+            && area.1 < area.3
+        {
+            painter.rect_stroke(
+                map.rect(area),
+                0.0,
+                Ink::new(1.5, Color32::from_rgb(66, 143, 118)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // This is the machine origin expressed in physical bed coordinates, not the artwork origin.
+        let origin = match self.profile.origin {
+            Origin::LeftBottom => Point::new(0.0, 0.0),
+            Origin::Center => Point::new(bed_x / 2.0, bed_y / 2.0),
+        };
+        let center = map.screen(origin);
+        painter.line_segment(
+            [center - egui::vec2(6.0, 0.0), center + egui::vec2(6.0, 0.0)],
+            Ink::new(1.5, Color32::DARK_RED),
+        );
+        painter.line_segment(
+            [center - egui::vec2(0.0, 6.0), center + egui::vec2(0.0, 6.0)],
+            Ink::new(1.5, Color32::DARK_RED),
+        );
+        if self.planned.is_empty()
+            && self.error.is_none()
+            && self.import_task.is_none()
+            && self.plan_task.is_none()
+        {
+            painter.text(
+                paper_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop artwork to start",
+                FontId::proportional(17.0),
+                Color32::from_rgb(78, 93, 91),
+            );
+        }
+        self.paint_route(&painter, map);
+        if self.tools != Tool::Pan {
+            self.draw_on_bed(ui, &response, &painter, map);
+        }
+        if let Some(at) = response.hover_pos() {
+            let point = map.paper(at);
+            painter.text(
+                base.right_bottom() - egui::vec2(12.0, 8.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("Paper X {:.1}  Y {:.1} mm", point.x, point.y),
+                FontId::monospace(11.0),
+                Color32::from_rgb(148, 166, 176),
+            );
+        }
+        painter.text(
+            base.left_top() + egui::vec2(11.0, 10.0),
+            egui::Align2::LEFT_TOP,
+            format!("BED  {} × {} mm", format_mm(bed_x), format_mm(bed_y)),
+            FontId::monospace(11.0),
+            BED,
+        );
+    }
+
+    fn isometric_canvas(&self, ui: &mut egui::Ui) {
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
+        let base = response.rect;
+        let painter = painter.with_clip_rect(base);
+        painter.rect_filled(base, 7.0, Color32::from_rgb(15, 21, 27));
+        let bed_x = self.profile.bed_x;
+        let bed_y = self.profile.bed_y;
+        let up = self.profile.pen_up_z + self.profile.offset_z;
+        let down = self.profile.pen_down_z + self.profile.offset_z;
+        let Some(map) = IsoMap::fit(
+            base.shrink2(egui::vec2(32.0, 55.0)),
+            bed_x,
+            bed_y,
+            up,
+            down,
+            self.z_exaggeration,
+        ) else {
+            painter.text(
+                base.center(),
+                egui::Align2::CENTER_CENTER,
+                "Check the machine dimensions and Z settings.",
+                FontId::proportional(15.0),
+                WARN,
+            );
+            return;
+        };
+        let corners = [
+            Point::new(0.0, 0.0),
+            Point::new(bed_x, 0.0),
+            Point::new(bed_x, bed_y),
+            Point::new(0.0, bed_y),
+        ];
+        let screen: Vec<_> = corners
+            .into_iter()
+            .map(|point| map.screen(point, 0.0))
+            .collect();
+        painter.add(egui::Shape::convex_polygon(
+            screen,
+            Color32::from_rgb(38, 53, 59),
+            Ink::new(1.3, Color32::from_rgb(83, 113, 118)),
+        ));
+        let grid = Ink::new(1.0, Color32::from_rgb(59, 78, 82));
+        for i in 1..10 {
+            let x = bed_x * f64::from(i) / 10.0;
+            let y = bed_y * f64::from(i) / 10.0;
+            painter.line_segment(
+                [
+                    map.screen(Point::new(x, 0.0), 0.0),
+                    map.screen(Point::new(x, bed_y), 0.0),
+                ],
+                grid,
+            );
+            painter.line_segment(
+                [
+                    map.screen(Point::new(0.0, y), 0.0),
+                    map.screen(Point::new(bed_x, y), 0.0),
+                ],
+                grid,
+            );
+        }
+        for (point, axis) in [
+            (Point::new(bed_x, 0.0), "+X"),
+            (Point::new(0.0, bed_y), "+Y"),
+        ] {
+            painter.text(
+                map.screen(point, 0.0),
+                egui::Align2::CENTER_TOP,
+                axis,
+                FontId::monospace(11.0),
+                BED,
+            );
+        }
+        let canvas = painter.clip_rect().expand(2.0);
+        trace_segments(
+            &self.planned[..self.shown.min(self.planned.len())],
+            up,
+            down,
+            |segment| {
+                let a = map.screen(segment.from.0, segment.from.1);
+                let b = map.screen(segment.to.0, segment.to.1);
+                if !Rect::from_two_pos(a, b).intersects(canvas) {
+                    return;
+                }
+                match segment.kind {
+                    MoveKind::Travel if self.show_travel => {
+                        paint_dashes(&painter, a, b, Ink::new(1.1, WARN))
+                    }
+                    MoveKind::Travel => (),
+                    _ => {
+                        painter.line_segment([a, b], Ink::new(1.6, segment.kind.color()));
+                    }
+                }
+            },
+        );
+        let mut legend = base.left_top() + egui::vec2(15.0, 13.0);
+        for (kind, name) in [
+            (MoveKind::Draw, "Draw"),
+            (MoveKind::Travel, "Travel"),
+            (MoveKind::Lift, "Lift"),
+            (MoveKind::Lower, "Lower"),
+        ] {
+            painter.line_segment(
+                [
+                    legend + egui::vec2(0.0, 7.0),
+                    legend + egui::vec2(15.0, 7.0),
+                ],
+                Ink::new(2.0, kind.color()),
+            );
+            painter.text(
+                legend + egui::vec2(20.0, 0.0),
+                egui::Align2::LEFT_TOP,
+                name,
+                FontId::proportional(13.0),
+                BED,
+            );
+            legend.x += 72.0;
+        }
+        painter.text(
+            base.left_bottom() + egui::vec2(15.0, -13.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("Commanded Z: up {up:.3} mm   /   down {down:.3} mm"),
+            FontId::monospace(11.0),
+            BED,
+        );
+    }
+
+    fn grid(&self, painter: &egui::Painter, map: CanvasMap, bed_x: f64, bed_y: f64) {
+        let mut step = 5.0_f64;
+        while (step as f32 * map.scale) < 13.0 || bed_x.max(bed_y) / step > 80.0 {
+            step *= 2.0;
+        }
+        let ink = Ink::new(1.0, GRID);
+        for i in 1..=(bed_x / step) as u32 {
+            let x = f64::from(i) * step;
+            painter.line_segment(
+                [
+                    map.screen(Point::new(x, 0.0)),
+                    map.screen(Point::new(x, bed_y)),
+                ],
+                ink,
+            );
+        }
+        for i in 1..=(bed_y / step) as u32 {
+            let y = f64::from(i) * step;
+            painter.line_segment(
+                [
+                    map.screen(Point::new(0.0, y)),
+                    map.screen(Point::new(bed_x, y)),
+                ],
+                ink,
+            );
+        }
+    }
+
+    fn paint_route(&self, painter: &egui::Painter, map: CanvasMap) {
+        let mut previous = None;
+        let clipped = painter.clip_rect().expand(2.0);
+        for (index, stroke) in self.planned.iter().enumerate() {
+            let Some(&first) = stroke.points.first() else {
+                continue;
+            };
+            let start = map.screen(first);
+            let active = index < self.shown;
+            if active
+                && self.show_travel
+                && let Some(last) = previous
+            {
+                paint_dashes(
+                    painter,
+                    last,
+                    start,
+                    Ink::new(1.2, Color32::from_rgb(209, 114, 59)),
+                );
+            }
+            let color = if active {
+                route_color(&stroke.layer)
+            } else {
+                Color32::from_rgb(193, 200, 198)
+            };
+            let ink = Ink::new(if active { 1.7 } else { 1.25 }, color);
+            let mut last = start;
+            for &point in &stroke.points[1..] {
+                let next = map.screen(point);
+                if Rect::from_two_pos(last, next).intersects(clipped) {
+                    painter.line_segment([last, next], ink);
+                }
+                last = next;
+            }
+            if stroke.closed {
+                painter.line_segment([last, start], ink);
+                last = start;
+            }
+            previous = Some(last);
+        }
+    }
+
+    fn draw_on_bed(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        painter: &egui::Painter,
+        map: CanvasMap,
+    ) {
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.draft.clear();
+            if let Some(position) = ui.input(|input| input.pointer.press_origin()) {
+                self.draft
+                    .push(map.paper(position.clamp(response.rect.min, response.rect.max)));
+            }
+        }
+        if !self.draft.is_empty()
+            && (response.dragged_by(egui::PointerButton::Primary)
+                || response.drag_stopped_by(egui::PointerButton::Primary))
+            && let Some(position) = ui.input(|input| input.pointer.interact_pos())
+        {
+            let point = map.paper(position.clamp(response.rect.min, response.rect.max));
+            if self.tools == Tool::Freehand {
+                let last = self.draft.last().copied().unwrap_or(point);
+                if self.draft.len() < 8192
+                    && ((last.x - point.x).hypot(last.y - point.y) >= 0.08
+                        || response.drag_stopped_by(egui::PointerButton::Primary))
+                {
+                    self.draft.push(point);
+                }
+            } else {
+                self.draft.truncate(1);
+                self.draft.push(point);
+            }
+        }
+        let Some((points, closed)) = draft_geometry(self.tools, &self.draft) else {
+            return;
+        };
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            self.draft.clear();
+            if let Err(error) = self.add_mark(points, closed) {
+                self.status = error;
+            }
+            ui.ctx().request_repaint();
+        } else {
+            let points: Vec<_> = points.into_iter().map(|point| map.screen(point)).collect();
+            let ink = Ink::new(1.8, Color32::from_rgb(37, 139, 121));
+            if closed {
+                painter.add(egui::Shape::closed_line(points, ink));
+            } else {
+                painter.add(egui::Shape::line(points, ink));
+            }
+        }
+    }
+
+    fn add_mark(&mut self, mut points: Vec<Point>, closed: bool) -> Result<(), String> {
+        if self.import_task.is_some() {
+            return Err("Wait for the current import before drawing.".into());
+        }
+        let (paths_used, points_used) = self.geometry_size();
+        if paths_used >= penplot::MAX_STROKES || points_used + points.len() > penplot::MAX_POINTS {
+            return Err(
+                "Workspace geometry limit reached. Remove other layers before drawing.".into(),
+            );
+        }
+        let scale = self.options.scale;
+        let (sin, cos) = self
+            .options
+            .rotation_deg
+            .rem_euclid(360.0)
+            .to_radians()
+            .sin_cos();
+        if !scale.is_finite()
+            || scale <= 0.0
+            || !cos.is_finite()
+            || !self.options.x.is_finite()
+            || !self.options.y.is_finite()
+        {
+            return Err("Correct the artwork placement before adding a mark.".into());
+        }
+        let raw_min = projected_min(&self.layers, scale, sin, cos);
+        let shift = match raw_min {
+            Some(min) => Point::new(self.options.x - min.x, self.options.y - min.y),
+            None => Point::new(0.0, 0.0),
+        };
+        let mut left = self.options.x;
+        let mut bottom = self.options.y;
+        if raw_min.is_none() {
+            left = f64::INFINITY;
+            bottom = f64::INFINITY;
+        }
+        for point in &mut points {
+            left = left.min(point.x);
+            bottom = bottom.min(point.y);
+            let x = (point.x - shift.x) / scale;
+            let y = (point.y - shift.y) / scale;
+            *point = Point::new(x * cos + y * sin, -x * sin + y * cos);
+        }
+        let existing = self.layers.last().is_some_and(|layer| {
+            layer.visible
+                && layer.name == "Canvas marks"
+                && matches!(layer.strokes.first(), Some(stroke) if stroke.layer == "Canvas marks")
+        });
+        if !existing && self.layers.len() >= MAX_LAYER_COUNT {
+            return Err("Layer limit reached. Remove a layer before adding canvas marks.".into());
+        }
+        self.record_layers();
+        self.options.x = left;
+        self.options.y = bottom;
+        let mut strokes = if existing {
+            self.layers
+                .pop()
+                .expect("Canvas marks layer was checked above")
+                .strokes
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        let group = strokes.len() as u32;
+        strokes.push(Stroke {
+            points,
+            layer: "Canvas marks".into(),
+            group,
+            closed,
+            filled: false,
+        });
+        self.layers.push(Layer {
+            name: "Canvas marks".into(),
+            strokes: strokes.into(),
+            visible: true,
+        });
+        self.selected = Some(self.layers.len() - 1);
+        self.status = format!("Added {} mark. Undo removes it.", self.tools.label());
+        self.invalidate();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IsoMap {
+    anchor: Pos2,
+    scale: f32,
+    z_exaggeration: f64,
+}
+
+impl IsoMap {
+    fn fit(
+        rect: Rect,
+        bed_x: f64,
+        bed_y: f64,
+        up: f64,
+        down: f64,
+        z_exaggeration: f64,
+    ) -> Option<Self> {
+        if !(0.001..=10_000.0).contains(&bed_x)
+            || !(0.001..=10_000.0).contains(&bed_y)
+            || !up.is_finite()
+            || !down.is_finite()
+            || up.abs() > 20_000.0
+            || down.abs() > 20_000.0
+        {
+            return None;
+        }
+        let z_span = up.max(down).max(0.0) - up.min(down).min(0.0);
+        let z_top = up.max(down).max(0.0);
+        let x_lo = -0.866_025_4 * bed_y;
+        let x_hi = 0.866_025_4 * bed_x;
+        let y_lo = -z_top * z_exaggeration;
+        let y_hi = y_lo + (bed_x + bed_y) * 0.5 + z_span * z_exaggeration;
+        let scale = (rect.width().max(20.0) / (x_hi - x_lo) as f32)
+            .min(rect.height().max(20.0) / (y_hi - y_lo) as f32);
+        Some(Self {
+            anchor: rect.center()
+                - egui::vec2((x_lo + x_hi) as f32 * 0.5, (y_lo + y_hi) as f32 * 0.5) * scale,
+            scale,
+            z_exaggeration,
+        })
+    }
+
+    fn screen(self, point: Point, z: f64) -> Pos2 {
+        self.anchor
+            + egui::vec2(
+                ((point.x - point.y) * 0.866_025_4) as f32,
+                ((point.x + point.y) * 0.5 - z * self.z_exaggeration) as f32,
+            ) * self.scale
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveKind {
+    Draw,
+    Travel,
+    Lift,
+    Lower,
+}
+
+impl MoveKind {
+    fn color(self) -> Color32 {
+        match self {
+            Self::Draw => Color32::from_rgb(116, 187, 252),
+            Self::Travel => WARN,
+            Self::Lift => ACCENT,
+            Self::Lower => Color32::from_rgb(239, 153, 222),
+        }
+    }
+}
+
+struct TraceSegment {
+    from: (Point, f64),
+    to: (Point, f64),
+    kind: MoveKind,
+}
+
+fn trace_segments(strokes: &[Stroke], up: f64, down: f64, mut emit: impl FnMut(TraceSegment)) {
+    let mut previous = None;
+    let mut line = |from, to, kind| emit(TraceSegment { from, to, kind });
+    for stroke in strokes {
+        let Some(&first) = stroke.points.first() else {
+            continue;
+        };
+        if let Some(last) = previous {
+            line((last, up), (first, up), MoveKind::Travel);
+        }
+        line((first, up), (first, down), MoveKind::Lower);
+        let mut last = first;
+        for &next in &stroke.points[1..] {
+            line((last, down), (next, down), MoveKind::Draw);
+            last = next;
+        }
+        if stroke.closed && last != first {
+            line((last, down), (first, down), MoveKind::Draw);
+            last = first;
+        }
+        line((last, down), (last, up), MoveKind::Lift);
+        previous = Some(last);
+    }
+}
+
+fn projected_min(layers: &[Layer], scale: f64, sin: f64, cos: f64) -> Option<Point> {
+    let mut x = f64::INFINITY;
+    let mut y = f64::INFINITY;
+    for point in layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .flat_map(|layer| layer.strokes.iter())
+        .flat_map(|stroke| stroke.points.iter())
+    {
+        x = x.min((point.x * cos - point.y * sin) * scale);
+        y = y.min((point.x * sin + point.y * cos) * scale);
+    }
+    (x.is_finite() && y.is_finite()).then(|| Point::new(x, y))
+}
+
+fn format_mm(value: f64) -> String {
+    if value.fract().abs() < 0.001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn route_color(layer: &str) -> Color32 {
+    let layer = layer.split_once(':').map_or(layer, |(_, style)| style);
+    if let Some(hex) = layer.strip_prefix('#').filter(|hex| hex.len() == 6)
+        && let Ok(code) = u32::from_str_radix(hex, 16)
+    {
+        let tone = |shift: u32| ((((code >> shift) & 0xffu32) as f32) * 0.65).round() as u8;
+        return Color32::from_rgb(tone(16), tone(8), tone(0));
+    }
+    Color32::from_rgb(37, 75, 124)
+}
+
+fn paint_dashes(painter: &egui::Painter, from: Pos2, to: Pos2, ink: Ink) {
+    // Limit work at high zoom and clip before tessellating very long trips.
+    let rect = painter.clip_rect();
+    let distance = (to - from).length();
+    if !(0.5..=80_000.0).contains(&distance) || !Rect::from_two_pos(from, to).intersects(rect) {
+        return;
+    }
+    let unit = (to - from) / distance;
+    let mut along = 0.0;
+    let period = 8.0_f32.max(distance / 500.0);
+    while along < distance {
+        let start = from + unit * along;
+        let end = from + unit * (along + period * 0.5).min(distance);
+        if Rect::from_two_pos(start, end).intersects(rect) {
+            painter.line_segment([start, end], ink);
+        }
+        along += period;
+    }
+}
+
+fn draft_geometry(tool: Tool, points: &[Point]) -> Option<(Vec<Point>, bool)> {
+    let (first, last) = (*points.first()?, *points.last()?);
+    let dx = last.x - first.x;
+    let dy = last.y - first.y;
+    let line = match tool {
+        Tool::Pan => return None,
+        Tool::Freehand if points.len() >= 2 => {
+            let distinct = points
+                .iter()
+                .any(|p| (p.x - first.x).hypot(p.y - first.y) >= 0.04);
+            distinct.then(|| (points.to_vec(), false))?
+        }
+        Tool::Line if dx.hypot(dy) >= 0.04 => (vec![first, last], false),
+        Tool::Rectangle if dx.abs() >= 0.04 && dy.abs() >= 0.04 => (
+            vec![
+                first,
+                Point::new(last.x, first.y),
+                last,
+                Point::new(first.x, last.y),
+            ],
+            true,
+        ),
+        Tool::Ellipse if dx.abs() >= 0.04 && dy.abs() >= 0.04 => {
+            let rx = dx.abs() * 0.5;
+            let ry = dy.abs() * 0.5;
+            let (cx, cy) = ((last.x + first.x) * 0.5, (last.y + first.y) * 0.5);
+            let max_r = rx.max(ry);
+            let count = (std::f64::consts::PI / (1.0 - 0.05 / max_r).clamp(0.0, 1.0).acos())
+                .ceil()
+                .clamp(16.0, 4096.0) as usize;
+            let path = (0..count)
+                .map(|i| {
+                    let t = i as f64 / count as f64 * std::f64::consts::TAU;
+                    Point::new(cx + rx * t.cos(), cy + ry * t.sin())
+                })
+                .collect();
+            (path, true)
+        }
+        _ => return None,
+    };
+    Some(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn egui_draws_empty_and_populated_frames_headlessly() {
+        let context = egui::Context::default();
+        let mut app = Studio::default();
+        let draw_frame = |app: &mut Studio| {
+            let frame = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1240.0, 780.0))),
+                    ..Default::default()
+                },
+                |context| app.update_ui(context),
+            );
+            let primitives = context.tessellate(frame.shapes, frame.pixels_per_point);
+            assert!(!primitives.is_empty());
+        };
+        draw_frame(&mut app);
+        app.add_mark(vec![Point::new(10.0, 12.0), Point::new(42.0, 55.0)], false)
+            .unwrap();
+        app.rebuild();
+        assert!(app.output.is_some());
+        for inspector in [Inspector::Artwork, Inspector::Machine, Inspector::Route] {
+            app.inspector = inspector;
+            draw_frame(&mut app);
+        }
+        app.isometric = true;
+        draw_frame(&mut app);
+    }
+
+    #[test]
+    fn isometric_projection_separates_bed_axes_and_raises_z_on_screen() {
+        let map = IsoMap::fit(
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            100.0,
+            100.0,
+            5.0,
+            2.0,
+            3.0,
+        )
+        .unwrap();
+        let origin = Point::new(0.0, 0.0);
+        assert!(map.screen(Point::new(10.0, 0.0), 0.0).x > map.screen(origin, 0.0).x);
+        assert!(map.screen(Point::new(0.0, 10.0), 0.0).x < map.screen(origin, 0.0).x);
+        assert!(map.screen(origin, 5.0).y < map.screen(origin, 2.0).y);
+    }
+
+    #[test]
+    fn isometric_trace_visualizes_lift_before_travel_and_at_end() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(20.0, 10.0)], false)
+            .unwrap();
+        app.add_mark(vec![Point::new(45.0, 50.0), Point::new(60.0, 50.0)], false)
+            .unwrap();
+        app.rebuild();
+        let mut moves = Vec::new();
+        trace_segments(&app.planned, 6.25, 2.75, |segment| moves.push(segment));
+        assert_eq!(
+            moves.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            [
+                MoveKind::Lower,
+                MoveKind::Draw,
+                MoveKind::Lift,
+                MoveKind::Travel,
+                MoveKind::Lower,
+                MoveKind::Draw,
+                MoveKind::Lift,
+            ]
+        );
+        assert_eq!((moves[2].from.1, moves[2].to.1), (2.75, 6.25));
+        assert_eq!((moves[3].from.1, moves[3].to.1), (6.25, 6.25));
+        assert_eq!(moves.last().unwrap().to.1, 6.25);
+    }
+
+    #[test]
+    fn export_requires_current_valid_route_and_session_calibration() {
+        let mut app = Studio::default();
+        assert!(app.air_first);
+        assert!(!app.can_export());
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(25.0, 10.0)], false)
+            .unwrap();
+        app.rebuild();
+        assert!(!app.can_export());
+        app.calibrated = true;
+        assert!(app.can_export());
+        let old_report = calculate_plan(app.revision, &app.snapshot(), &app.profile);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(old_report).unwrap();
+        app.plan_task = Some(receiver);
+        app.invalidate();
+        app.poll_plan(&egui::Context::default());
+        assert!(!app.can_export());
+        assert!(
+            app.planned.is_empty(),
+            "stale route must not be shown or exported"
+        );
+    }
+
+    #[test]
+    fn loading_project_discards_history_and_resets_the_session_gate() {
+        let mut original = Studio::default();
+        original
+            .add_mark(vec![Point::new(10.0, 10.0), Point::new(42.0, 10.0)], false)
+            .unwrap();
+        original.rebuild();
+        original.calibrated = true;
+        let project = Project::from_json(&original.as_project().to_json().unwrap()).unwrap();
+        original.air_first = false;
+        assert!(original.can_export());
+        original.apply_project(PathBuf::from("example.penplot"), project);
+        assert!(!original.project_dirty);
+        assert!(original.preview_dirty);
+        assert!(!original.can_export());
+        assert!(original.air_first);
+        assert!(original.undo.is_empty());
+        assert_eq!(original.layers.len(), 1);
+        original.rebuild();
+        assert!(!original.can_export());
+    }
+
+    #[test]
+    fn missing_artwork_error_does_not_create_layer() {
+        let path = Path::new("surely-not-a-real-penplot-artwork-274036.svg");
+        let error = match import_one(path, &ImportOptions::default()) {
+            Ok(_) => panic!("test path unexpectedly exists"),
+            Err(error) => error,
+        };
+        assert!(error.contains("surely-not-a-real"));
+    }
+
+    #[test]
+    fn canvas_coordinates_round_trip_and_preserve_y_up() {
+        let map = CanvasMap {
+            anchor: Pos2::new(100.0, 200.0),
+            scale: 3.0,
+        };
+        let point = Point::new(22.0, -5.0);
+        assert_eq!(map.screen(point), Pos2::new(166.0, 215.0));
+        let actual = map.paper(map.screen(point));
+        assert_eq!((actual.x, actual.y), (point.x, point.y));
+    }
+
+    #[test]
+    fn editing_invalidates_a_plotted_result_and_can_undo_redo() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(12.0, 10.0), Point::new(42.0, 10.0)], false)
+            .unwrap();
+        assert_eq!(app.layers.len(), 1);
+        assert_eq!(app.options.x, 12.0);
+        app.rebuild();
+        assert_eq!(app.planned.len(), 1);
+        app.undo();
+        assert!(app.layers.is_empty());
+        assert!(app.output.is_none());
+        assert!(app.preview_dirty);
+        app.redo();
+        assert_eq!(app.layers.len(), 1);
+        assert_eq!(app.options.x, 12.0);
+    }
+
+    #[test]
+    fn drawing_outside_existing_bounds_does_not_shift_existing_stroke() {
+        let mut app = Studio::default();
+        app.options.rotation_deg = 45.0;
+        app.options.scale = 1.75;
+        app.add_mark(vec![Point::new(20.0, 20.0), Point::new(45.0, 20.0)], false)
+            .unwrap();
+        app.add_mark(vec![Point::new(5.0, 10.0), Point::new(10.0, 15.0)], false)
+            .unwrap();
+        app.options.optimize = false;
+        app.rebuild();
+        assert_eq!(app.planned.len(), 2);
+        assert!((app.planned[0].points[0].x - 20.0).abs() < 1e-9);
+        assert!((app.planned[0].points[0].y - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shape_tools_generate_closed_usable_contours() {
+        let points = [Point::new(25.0, 37.0), Point::new(9.0, 7.0)];
+        let (outline, closed) = draft_geometry(Tool::Rectangle, &points).unwrap();
+        assert!(closed);
+        assert_eq!(outline.len(), 4);
+        let (outline, closed) = draft_geometry(Tool::Ellipse, &points).unwrap();
+        assert!(closed);
+        assert!(outline.len() >= 16);
+        assert!((outline[0].x - 25.0).abs() < 0.001);
+        assert!((outline[0].y - 22.0).abs() < 0.001);
+        assert!(draft_geometry(Tool::Ellipse, &points[..1]).is_none());
+    }
+}

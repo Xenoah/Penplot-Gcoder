@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="46mm" height="30mm" viewBox="0 0 46 30">
+  <title>Penplot alignment card: 40 x 24 mm frame with inside check marks</title>
+  <g fill="none" stroke="#24697a" stroke-width=".25">
+    <path d="M3 3H43V27H3Z"/>
+    <path d="M5 8V5H8 M38 5H41V8 M5 22V25H8 M38 25H41V22"/>
+    <path d="M10 15H20 M15 10V20"/>
+    <circle cx="15" cy="15" r="3"/>
+    <path d="M22 21H37 M24 21V19 M27 21V18 M30 21V19 M33 21V18 M36 21V19"/>
+  </g>
+  <path fill="#35415a" fill-rule="evenodd" d="M25 14l5-7 5 7Z M29 12h2l-1-1.6Z"/>
+</svg>
