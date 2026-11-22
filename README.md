@@ -85,3 +85,7 @@ cargo build --locked --release --bins
 ```
 
 Rust の入口は `src-rs/lib.rs`（変換）、`src-rs/desktop.rs`（GUI）、`src-rs/cli.rs`（CLI）。`tests/pipeline.rs` は実ファイル、穴付き塗り、配置、空走、上書き拒否、同一出力を検査する。
+
+### Selecting and deleting objects
+
+Click a line in Pan, Move, Scale or Rotate to select its object, or select a row in the Layers list. Imported SVG/DXF/images are selected as whole layers; a canvas mark is selected as one continuous stroke. A layer row always targets that whole layer. Delete or the scoped right-click menu removes the selected object, and Ctrl+Z restores it (Ctrl+Y / Ctrl+Shift+Z redo). Right-clicking blank canvas clears the selection. Text/number editing, dialogs, import work and active drags keep their own keys. Deleting an object preserves the placement of the remaining artwork and invalidates generated output until replanning finishes.

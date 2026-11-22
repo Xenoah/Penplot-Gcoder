@@ -15,6 +15,9 @@ use std::time::Duration;
 
 mod export_preview;
 use export_preview::{ExportInspection, format_duration};
+mod object_edit;
+use object_edit::{ObjectContext, Selection};
+
 mod raster_ui;
 use raster_ui::RasterImport;
 
@@ -99,6 +102,7 @@ enum Inspector {
 struct Snapshot {
     layers: Vec<Layer>,
     options: JobOptions,
+    selected: Option<Selection>,
 }
 
 struct Imported {
@@ -121,7 +125,9 @@ struct Studio {
     layers: Vec<Layer>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
-    selected: Option<usize>,
+    selected: Option<Selection>,
+    route_targets: Vec<Option<Selection>>,
+    object_context: Option<ObjectContext>,
     import_options: ImportOptions,
     profile: Profile,
     options: JobOptions,
@@ -170,6 +176,8 @@ impl Default for Studio {
             undo: Vec::new(),
             redo: Vec::new(),
             selected: None,
+            route_targets: Vec::new(),
+            object_context: None,
             import_options: ImportOptions::default(),
             profile: Profile::default(),
             options: JobOptions::default(),
@@ -295,6 +303,7 @@ impl Studio {
             self.add_raster_layer(item, settings);
         }
         self.confirm_project_actions(ctx);
+        self.object_shortcuts(ctx);
         if self.preview_dirty && self.plan_task.is_none() {
             ctx.request_repaint();
         }
@@ -384,32 +393,22 @@ impl Studio {
         if self.raster_import.is_busy() {
             return;
         }
-        let shortcuts = ctx.input(|i| {
-            let has = |key| i.modifiers.command && i.key_pressed(key);
+        let (open, save, shift) = ctx.input(|i| {
             (
-                has(Key::O),
-                has(Key::Z),
-                has(Key::Y),
+                i.modifiers.command && i.key_pressed(Key::O),
+                i.modifiers.command && i.key_pressed(Key::S),
                 i.modifiers.shift,
-                has(Key::S),
             )
         });
-        if shortcuts.0 {
-            if shortcuts.3 {
+        if open {
+            if shift {
                 self.open_project_dialog();
             } else {
                 self.select_files(ctx);
             }
         }
-        if shortcuts.4 {
+        if save {
             self.save_project_dialog();
-        }
-        if !ctx.wants_keyboard_input() {
-            if shortcuts.2 || (shortcuts.1 && shortcuts.3) {
-                self.redo();
-            } else if shortcuts.1 {
-                self.undo();
-            }
         }
     }
 
@@ -522,7 +521,7 @@ impl Studio {
             visible: true,
             raster: Some(raster),
         });
-        self.selected = Some(self.layers.len() - 1);
+        self.selected = Some(Selection::Layer(self.layers.len() - 1));
         self.status = "Image layer imported. Check placement before export.".into();
         self.inspector = Inspector::Artwork;
         self.invalidate();
@@ -550,7 +549,7 @@ impl Studio {
                             raster: None,
                         });
                     }
-                    self.selected = Some(self.layers.len() - 1);
+                    self.selected = Some(Selection::Layer(self.layers.len() - 1));
                     self.status =
                         format!("{count} layer(s) imported. Check placement before export.");
                     self.inspector = Inspector::Artwork;
@@ -585,6 +584,7 @@ impl Studio {
         Snapshot {
             layers: self.layers.clone(),
             options: self.options.clone(),
+            selected: self.selected,
         }
     }
 
@@ -613,7 +613,7 @@ impl Studio {
             self.redo.push(self.snapshot());
             self.layers = previous.layers;
             self.options = previous.options;
-            self.selected = None;
+            self.selected = previous.selected;
             self.invalidate();
         }
     }
@@ -626,7 +626,7 @@ impl Studio {
             self.undo.push(self.snapshot());
             self.layers = next.layers;
             self.options = next.options;
-            self.selected = None;
+            self.selected = next.selected;
             self.invalidate();
         }
     }
@@ -638,6 +638,8 @@ impl Studio {
         self.revision = self.revision.wrapping_add(1);
         self.output = None;
         self.planned.clear();
+        self.route_targets.clear();
+        self.object_context = None;
         self.shown = 0;
         self.error = None;
         self.raster_removed = (0, 0.0);
@@ -717,94 +719,6 @@ impl Studio {
                 Inspector::Machine => self.machine_panel(ui),
                 Inspector::Route => self.route_panel(ui),
             });
-    }
-
-    fn artwork_panel(&mut self, ui: &mut egui::Ui) {
-        section(ui, "LAYERS");
-        if self.layers.is_empty() {
-            ui.label(RichText::new("Drop SVG, DXF, PNG or JPEG files here.").weak());
-        }
-        let mut action = None;
-        for (index, layer) in self.layers.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let mut visible = layer.visible;
-                if ui
-                    .checkbox(&mut visible, "")
-                    .on_hover_text("Include in drawing")
-                    .changed()
-                {
-                    action = Some((index, LayerAction::Visibility(visible)));
-                }
-                let label = format!("{}  ·  {}", layer.name, layer.strokes.len());
-                if ui
-                    .selectable_label(self.selected == Some(index), label)
-                    .clicked()
-                {
-                    self.selected = Some(index);
-                }
-            });
-        }
-        if let Some(index) = self.selected.filter(|&index| index < self.layers.len()) {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(index > 0, egui::Button::new("Move up"))
-                    .clicked()
-                {
-                    action = Some((index, LayerAction::Move(index - 1)));
-                }
-                if ui
-                    .add_enabled(
-                        index + 1 < self.layers.len(),
-                        egui::Button::new("Move down"),
-                    )
-                    .clicked()
-                {
-                    action = Some((index, LayerAction::Move(index + 1)));
-                }
-                if ui.button("Remove").clicked() {
-                    action = Some((index, LayerAction::Delete));
-                }
-            });
-        }
-        if let Some((index, action)) = action {
-            self.record_layers();
-            match action {
-                LayerAction::Visibility(value) => self.layers[index].visible = value,
-                LayerAction::Move(target) => {
-                    self.layers.swap(index, target);
-                    self.selected = Some(target);
-                }
-                LayerAction::Delete => {
-                    self.layers.remove(index);
-                    self.selected = None;
-                }
-            }
-            self.invalidate();
-        }
-        if let Some(index) = self.selected.filter(|&index| index < self.layers.len())
-            && let Some(mut settings) = self.layers[index].raster.clone()
-        {
-            ui.separator();
-            section(ui, "IMAGE LAYER FILL");
-            raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
-            if self.layers[index].raster.as_ref() != Some(&settings) {
-                self.record_layers();
-                self.layers[index].raster = Some(settings);
-                self.invalidate();
-            }
-            ui.small("Reimport the original image to change threshold, DPI, or inversion.");
-        }
-        ui.separator();
-        self.placement_panel(ui);
-        ui.separator();
-        self.import_panel(ui);
-        if !self.notices.is_empty() {
-            ui.separator();
-            section(ui, "IMPORT NOTES");
-            for notice in &self.notices {
-                ui.colored_label(WARN, notice);
-            }
-        }
     }
 
     fn open_project_dialog(&mut self) {
@@ -1081,7 +995,6 @@ impl Studio {
 enum LayerAction {
     Visibility(bool),
     Move(usize),
-    Delete,
 }
 
 fn section(ui: &mut egui::Ui, label: &str) {
@@ -1500,6 +1413,7 @@ impl Studio {
         match report.result {
             Ok((planned, output)) => {
                 self.planned = planned;
+                self.route_targets = self.build_route_targets();
                 self.shown = self.planned.len();
                 match output {
                     Ok(output) => self.output = Some(Arc::new(output)),
@@ -1919,7 +1833,7 @@ impl Studio {
             self.isometric_canvas(ui);
             return;
         }
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::drag());
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let base = response.rect;
         let bed_x = if (0.001..=10_000.0).contains(&self.profile.bed_x) {
             self.profile.bed_x
@@ -2010,6 +1924,7 @@ impl Studio {
                 Color32::from_rgb(78, 93, 91),
             );
         }
+        self.object_canvas_ui(ui, &response, map);
         if self.tools.placement() {
             self.handle_placement(ui, &response, map);
             if let Some(drag) = &self.placement_drag {
@@ -2239,7 +2154,15 @@ impl Studio {
             } else {
                 Color32::from_rgb(193, 200, 198)
             };
-            let ink = Ink::new(if active { 1.7 } else { 1.25 }, color);
+            let selected = self
+                .selected
+                .zip(self.route_targets.get(index).copied().flatten())
+                .is_some_and(|(selected, target)| selected.contains(target));
+            let ink = if selected {
+                Ink::new(3.0, Color32::from_rgb(20, 150, 115))
+            } else {
+                Ink::new(if active { 1.7 } else { 1.25 }, color)
+            };
             let mut last = start;
             for &point in &stroke.points[1..] {
                 let next = map.screen(transform(point));
@@ -2360,6 +2283,20 @@ impl Studio {
         if !existing && self.layers.len() >= MAX_LAYER_COUNT {
             return Err("Layer limit reached. Remove a layer before adding canvas marks.".into());
         }
+        let group = if existing {
+            self.layers
+                .last()
+                .unwrap()
+                .strokes
+                .iter()
+                .map(|stroke| stroke.group)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or("Canvas group limit reached")?
+        } else {
+            0
+        };
         self.record_layers();
         self.options.x = left;
         self.options.y = bottom;
@@ -2372,7 +2309,7 @@ impl Studio {
         } else {
             Vec::new()
         };
-        let group = strokes.len() as u32;
+        let stroke_index = strokes.len();
         strokes.push(Stroke {
             points,
             layer: "Canvas marks".into(),
@@ -2386,7 +2323,10 @@ impl Studio {
             visible: true,
             raster: None,
         });
-        self.selected = Some(self.layers.len() - 1);
+        self.selected = Some(Selection::Mark {
+            layer: self.layers.len() - 1,
+            stroke: stroke_index,
+        });
         self.status = format!("Added {} mark. Undo removes it.", self.tools.label());
         self.invalidate();
         Ok(())
