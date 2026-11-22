@@ -1,10 +1,13 @@
 //! Versioned portable document format. Calibration acknowledgement is session
 //! state; opening a project never makes it eligible for machine export.
-use crate::{ImportOptions, JobOptions, MAX_FILE_BYTES, MAX_POINTS, MAX_STROKES, Profile, Stroke};
+use crate::{
+    ImportOptions, JobOptions, MAX_FILE_BYTES, MAX_POINTS, MAX_STROKES, Profile, RasterSettings,
+    Stroke, is_raster_filename,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const MAX_LAYERS: usize = 128;
 const MAX_NAME: usize = 512;
 const MAX_COORD: f64 = 1e8;
@@ -15,6 +18,28 @@ pub struct ProjectLayer {
     pub name: String,
     pub visible: bool,
     pub strokes: Vec<Stroke>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "raster_settings",
+        alias = "image_settings",
+        alias = "raster_layer",
+        alias = "raster_options"
+    )]
+    pub raster: Option<RasterSettings>,
+}
+
+impl ProjectLayer {
+    pub fn raster_settings(&self, options: &JobOptions) -> Option<RasterSettings> {
+        self.raster.clone().or_else(|| {
+            (is_raster_filename(&self.name)
+                && !self.strokes.is_empty()
+                && self.strokes.iter().all(|stroke| {
+                    stroke.layer == "Raster contours" && stroke.closed && stroke.filled
+                }))
+            .then(|| RasterSettings::from_job(options))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,7 +95,7 @@ impl Project {
         let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
         let wire: LoadProject =
             serde_json::from_slice(bytes).map_err(|err| format!("Invalid project JSON: {err}"))?;
-        if wire.version != SCHEMA {
+        if !(1..=SCHEMA).contains(&wire.version) {
             return Err(format!("Unsupported project version {}", wire.version));
         }
         let project = Self {
@@ -111,6 +136,9 @@ impl Project {
         {
             return Err("Invalid project scale, rotation or placement".into());
         }
+        if !(0.0..=10_000.).contains(&options.min_image_stroke_mm) {
+            return Err("Invalid minimum image stroke".into());
+        }
         if !options.hatch_angle.is_finite() || !(0.02..=1000.0).contains(&options.hatch_spacing) {
             return Err("Invalid project hatch settings".into());
         }
@@ -127,6 +155,9 @@ impl Project {
         for (i, layer) in self.layers.iter().enumerate() {
             if !valid_name(&layer.name) {
                 return Err(format!("Invalid project layer name at layer {}", i + 1));
+            }
+            if let Some(settings) = &layer.raster {
+                settings.validate()?;
             }
             paths += layer.strokes.len();
             if paths > MAX_STROKES {
@@ -204,6 +235,7 @@ mod tests {
         project.options.fill = Fill::Cross;
         project.import_options.invert = true;
         project.layers.push(ProjectLayer {
+            raster: None,
             name: "図形".to_owned(),
             visible: false,
             strokes: vec![Stroke {
@@ -227,11 +259,11 @@ mod tests {
         let bytes = blank().to_json().unwrap();
         let raw = std::str::from_utf8(&bytes).unwrap();
         for malformed in [
-            raw.replacen("\"version\":1", "\"version\":7", 1),
-            raw.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+            raw.replacen("\"version\":2", "\"version\":7", 1),
+            raw.replacen("\"version\":2", "\"version\":2,\"version\":2", 1),
             raw.replacen(
-                "\"version\":1",
-                "\"version\":1,\"calibration_acknowledged\":true",
+                "\"version\":2",
+                "\"version\":2,\"calibration_acknowledged\":true",
                 1,
             ),
             raw.replacen("\"bed_x\":100.0", "\"bed_x\":0.0", 1),
@@ -253,6 +285,7 @@ mod tests {
         assert!(project.to_json().unwrap_err().contains("scale"));
         project.options = JobOptions::default();
         project.layers.push(ProjectLayer {
+            raster: None,
             name: "ok".to_owned(),
             visible: true,
             strokes: vec![Stroke {
@@ -282,6 +315,7 @@ mod tests {
         let mut project = blank();
         project.layers = vec![
             ProjectLayer {
+                raster: None,
                 name: "ok".to_owned(),
                 visible: true,
                 strokes: vec![],

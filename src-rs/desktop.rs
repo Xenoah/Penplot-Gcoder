@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+mod raster_ui;
+use raster_ui::RasterImport;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -40,11 +43,15 @@ struct Layer {
     name: String,
     strokes: Arc<[Stroke]>,
     visible: bool,
+    raster: Option<penplot::RasterSettings>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Pan,
+    Move,
+    Scale,
+    Rotate,
     Line,
     Rectangle,
     Ellipse,
@@ -55,10 +62,26 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Pan => "Pan",
+            Self::Move => "Move",
+            Self::Scale => "Scale",
+            Self::Rotate => "Rotate",
             Self::Line => "Line",
             Self::Rectangle => "Box",
             Self::Ellipse => "Ellipse",
             Self::Freehand => "Freehand",
+        }
+    }
+
+    fn placement(self) -> bool {
+        matches!(self, Self::Move | Self::Scale | Self::Rotate)
+    }
+
+    fn label_localized(self, japanese: bool) -> &'static str {
+        match (self, japanese) {
+            (Self::Move, true) => "移動",
+            (Self::Scale, true) => "拡大縮小",
+            (Self::Rotate, true) => "回転",
+            _ => self.label(),
         }
     }
 }
@@ -88,6 +111,7 @@ struct ImportReport {
 
 struct PlanReport {
     revision: u64,
+    removed: (usize, f64),
     result: Result<(Vec<Stroke>, Result<Output, String>), String>,
 }
 
@@ -111,12 +135,15 @@ struct Studio {
     error: Option<String>,
     planned: Vec<Stroke>,
     output: Option<Output>,
-    calibrated: bool,
+    placement_drag: Option<PlacementDrag>,
+    placement_bounds_cache: Option<(u64, Option<[Point; 4]>)>,
     show_travel: bool,
     play: bool,
     shown: usize,
     last_tick: f64,
     import_task: Option<mpsc::Receiver<ImportReport>>,
+    raster_import: RasterImport,
+    raster_removed: (usize, f64),
     import_dialog: Option<mpsc::Receiver<Option<Vec<PathBuf>>>>,
     last_export_dir: Option<PathBuf>,
     project_file: Option<PathBuf>,
@@ -156,12 +183,15 @@ impl Default for Studio {
             error: None,
             planned: Vec::new(),
             output: None,
-            calibrated: false,
-            show_travel: true,
+            placement_drag: None,
+            placement_bounds_cache: None,
+            show_travel: false,
             play: false,
             shown: 0,
             last_tick: 0.0,
             import_task: None,
+            raster_import: RasterImport::default(),
+            raster_removed: (0, 0.0),
             import_dialog: None,
             last_export_dir: None,
             project_file: None,
@@ -232,9 +262,12 @@ impl Studio {
         }
         self.take_file_selection(ctx);
         self.poll_import();
-        self.shortcuts(ctx);
-        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+        if ctx.input(|input| input.key_pressed(Key::Escape) || !input.focused) {
             self.draft.clear();
+            self.placement_drag = None;
+        }
+        if self.placement_drag.is_none() {
+            self.shortcuts(ctx);
         }
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if !dropped.is_empty() {
@@ -252,6 +285,13 @@ impl Studio {
         egui::CentralPanel::default().show(ctx, |ui| self.canvas(ui));
         self.gcode_window(ctx);
         self.help_window(ctx);
+        if self.import_task.is_none()
+            && !self.confirm_quit
+            && self.pending_open.is_none()
+            && let Some((item, settings)) = self.raster_import.show(ctx, &self.import_options)
+        {
+            self.add_raster_layer(item, settings);
+        }
         self.confirm_project_actions(ctx);
         if self.preview_dirty && self.plan_task.is_none() {
             ctx.request_repaint();
@@ -266,7 +306,9 @@ impl Studio {
             ui.heading(RichText::new("PENPLOT").strong().color(ACCENT));
             ui.label(RichText::new("STUDIO  /  RUST").small().weak());
             ui.separator();
-            let busy = self.import_task.is_some() || self.import_dialog.is_some();
+            let busy = self.import_task.is_some()
+                || self.import_dialog.is_some()
+                || self.raster_import.is_busy();
             if ui
                 .add_enabled(!busy, egui::Button::new("Import…"))
                 .clicked()
@@ -318,9 +360,7 @@ impl Studio {
                 };
                 if ui
                     .add_enabled(enabled, egui::Button::new(title))
-                    .on_disabled_hover_text(
-                        "Plan a valid job and confirm the measured setup on the Machine tab.",
-                    )
+                    .on_disabled_hover_text("Wait for a valid, current route before exporting.")
                     .clicked()
                 {
                     self.save_gcode(self.air_first);
@@ -334,10 +374,7 @@ impl Studio {
                     self.inspection_air = None;
                 }
                 if ui
-                    .add_enabled(
-                        self.output.is_some() && !self.preview_dirty,
-                        egui::Button::new("Inspect G-code"),
-                    )
+                    .add_enabled(enabled, egui::Button::new("Inspect G-code"))
                     .clicked()
                 {
                     if self.air_first {
@@ -357,6 +394,9 @@ impl Studio {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.raster_import.is_busy() {
+            return;
+        }
         let shortcuts = ctx.input(|i| {
             let has = |key| i.modifiers.command && i.key_pressed(key);
             (
@@ -387,7 +427,10 @@ impl Studio {
     }
 
     fn select_files(&mut self, ctx: &egui::Context) {
-        if self.import_task.is_some() || self.import_dialog.is_some() {
+        if self.import_task.is_some()
+            || self.import_dialog.is_some()
+            || self.raster_import.is_busy()
+        {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -410,28 +453,37 @@ impl Studio {
         if paths.is_empty() {
             return;
         }
-        if self.import_task.is_some() {
+        if self.import_task.is_some() || self.raster_import.is_busy() {
             self.status = "An import is already in progress; try again when it finishes.".into();
+            return;
+        }
+        let available = MAX_LAYER_COUNT.saturating_sub(self.layers.len());
+        if paths.len() > available {
+            self.notices = vec![format!(
+                "Layer limit: {} of {} selected files can be imported.",
+                available,
+                paths.len()
+            )];
+        } else {
+            self.notices.clear();
+        }
+        let (rasters, paths): (Vec<_>, Vec<_>) = paths
+            .into_iter()
+            .take(available)
+            .partition(|path| penplot::is_raster_filename(&path.to_string_lossy()));
+        self.raster_import.extend(rasters);
+        if paths.is_empty() {
             return;
         }
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let options = self.import_options.clone();
-        let available = MAX_LAYER_COUNT.saturating_sub(self.layers.len());
         let (mut paths_used, mut points_used) = self.geometry_size();
         self.status = "Reading and tracing artwork…".into();
         std::thread::spawn(move || {
             let mut notices = Vec::new();
-            if paths.len() > available {
-                notices.push(format!(
-                    "Layer limit: {} of {} selected files can be imported.",
-                    available,
-                    paths.len()
-                ));
-            }
             let items = paths
                 .iter()
-                .take(available)
                 .filter_map(|path| match import_one(path, &options) {
                     Ok(item) => {
                         let strokes = item.artwork.strokes.len();
@@ -457,12 +509,44 @@ impl Studio {
         self.import_task = Some(receiver);
     }
 
+    fn add_raster_layer(&mut self, item: Imported, raster: penplot::RasterSettings) {
+        let (paths, points) = self.geometry_size();
+        if self.layers.len() >= MAX_LAYER_COUNT
+            || paths + item.artwork.strokes.len() > penplot::MAX_STROKES
+            || points
+                + item
+                    .artwork
+                    .strokes
+                    .iter()
+                    .map(|s| s.points.len())
+                    .sum::<usize>()
+                > penplot::MAX_POINTS
+        {
+            self.notices
+                .push(format!("{}: workspace geometry limit reached.", item.name));
+            self.inspector = Inspector::Artwork;
+            return;
+        }
+        self.record_layers();
+        self.notices.extend(item.artwork.warnings);
+        self.layers.push(Layer {
+            name: item.name,
+            strokes: item.artwork.strokes.into(),
+            visible: true,
+            raster: Some(raster),
+        });
+        self.selected = Some(self.layers.len() - 1);
+        self.status = "Image layer imported. Check placement before export.".into();
+        self.inspector = Inspector::Artwork;
+        self.invalidate();
+    }
+
     fn poll_import(&mut self) {
         if let Some(task) = &self.import_task {
             match task.try_recv() {
                 Ok(result) => {
                     self.import_task = None;
-                    self.notices = result.notices;
+                    self.notices.extend(result.notices);
                     if result.items.is_empty() {
                         self.status = "No artwork imported. See the notes in Artwork.".into();
                         self.inspector = Inspector::Artwork;
@@ -476,6 +560,7 @@ impl Studio {
                             name: imported.name,
                             strokes: imported.artwork.strokes.into(),
                             visible: true,
+                            raster: None,
                         });
                     }
                     self.selected = Some(self.layers.len() - 1);
@@ -560,6 +645,7 @@ impl Studio {
     }
 
     fn invalidate(&mut self) {
+        self.placement_drag = None;
         self.preview_dirty = true;
         self.project_dirty = true;
         self.revision = self.revision.wrapping_add(1);
@@ -569,6 +655,7 @@ impl Studio {
         self.planned.clear();
         self.shown = 0;
         self.error = None;
+        self.raster_removed = (0, 0.0);
         self.play = false;
     }
 
@@ -702,6 +789,19 @@ impl Studio {
             }
             self.invalidate();
         }
+        if let Some(index) = self.selected.filter(|&index| index < self.layers.len())
+            && let Some(mut settings) = self.layers[index].raster.clone()
+        {
+            ui.separator();
+            section(ui, "IMAGE LAYER FILL");
+            raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
+            if self.layers[index].raster.as_ref() != Some(&settings) {
+                self.record_layers();
+                self.layers[index].raster = Some(settings);
+                self.invalidate();
+            }
+            ui.small("Reimport the original image to change threshold, DPI, or inversion.");
+        }
         ui.separator();
         self.placement_panel(ui);
         ui.separator();
@@ -716,7 +816,10 @@ impl Studio {
     }
 
     fn open_project_dialog(&mut self) {
-        if self.import_dialog.is_some() || self.import_task.is_some() || self.pending_open.is_some()
+        if self.import_dialog.is_some()
+            || self.import_task.is_some()
+            || self.raster_import.is_busy()
+            || self.pending_open.is_some()
         {
             return;
         }
@@ -734,7 +837,10 @@ impl Studio {
     }
 
     fn save_project_dialog(&mut self) {
-        if self.import_dialog.is_some() || self.import_task.is_some() {
+        if self.import_dialog.is_some()
+            || self.import_task.is_some()
+            || self.raster_import.is_busy()
+        {
             return;
         }
         let mut dialog = rfd::FileDialog::new().add_filter("Penplot project", &["penplot"]);
@@ -777,6 +883,7 @@ impl Studio {
                     name: layer.name.clone(),
                     visible: layer.visible,
                     strokes: layer.strokes.to_vec(),
+                    raster: layer.raster.clone(),
                 })
                 .collect(),
             options: self.options.clone(),
@@ -786,13 +893,18 @@ impl Studio {
     }
 
     fn apply_project(&mut self, path: PathBuf, project: Project) {
+        let options = &project.options;
         self.layers = project
             .layers
             .into_iter()
-            .map(|layer| Layer {
-                name: layer.name,
-                visible: layer.visible,
-                strokes: layer.strokes.into(),
+            .map(|layer| {
+                let raster = layer.raster_settings(options);
+                Layer {
+                    name: layer.name,
+                    visible: layer.visible,
+                    strokes: layer.strokes.into(),
+                    raster,
+                }
             })
             .collect();
         self.options = project.options;
@@ -807,14 +919,11 @@ impl Studio {
         self.undo.clear();
         self.redo.clear();
         self.selected = None;
-        self.calibrated = false;
+        self.placement_drag = None;
         self.air_first = true;
         self.show_gcode = false;
         self.inspector = Inspector::Artwork;
-        self.status = format!(
-            "Opened {}. Reconfirm the measured setup before export.",
-            path.display()
-        );
+        self.status = format!("Opened {}.", path.display());
         self.project_file = Some(path);
         self.invalidate();
         self.project_dirty = false;
@@ -877,7 +986,7 @@ impl Studio {
                     ui.label("4. 問題なければ Air run first を外して描画用 G-code を出力します。");
                 } else {
                     ui.label("1. Import your drawing and use Fit to usable bed if needed.");
-                    ui.label("2. Set and confirm measured Z, offsets and travel limits in Machine.");
+                    ui.label("2. Enter measured Z, offsets and travel limits in Machine before running on hardware.");
                     ui.label("3. Home manually with clearance; export and verify a pen-up air run.");
                     ui.label("4. Uncheck Air run first only when ready to export the drawing file.");
                 }
@@ -890,6 +999,7 @@ impl Studio {
         if !self.show_gcode {
             return;
         }
+        let can_copy = self.can_export();
         egui::Window::new(if self.air_first {
             "Air-run G-code"
         } else {
@@ -909,7 +1019,7 @@ impl Studio {
                 return;
             };
             if ui
-                .add_enabled(self.calibrated, egui::Button::new("Copy entire file"))
+                .add_enabled(can_copy, egui::Button::new("Copy entire file"))
                 .clicked()
             {
                 ui.ctx().copy_text(result.gcode.clone());
@@ -938,11 +1048,7 @@ impl Studio {
         if !self.can_export() {
             return;
         }
-        let Some(output) = self
-            .output
-            .as_ref()
-            .filter(|_| self.calibrated && !self.preview_dirty)
-        else {
+        let Some(output) = self.output.as_ref() else {
             return;
         };
         let air;
@@ -1096,6 +1202,25 @@ struct Camera {
 }
 
 impl Studio {
+    fn fit_artwork(&self, options: &mut JobOptions) -> Result<(), String> {
+        self.combined()
+            .and_then(|strokes| penplot::fit(&strokes, &self.profile, options, 5.0))
+    }
+
+    fn fit_and_reset_view(&mut self) {
+        let mut draft = self.options.clone();
+        match self.fit_artwork(&mut draft) {
+            Ok(()) => {
+                self.record_layers();
+                self.options = draft;
+                self.frame = Camera::default();
+                self.status = "Artwork fitted to the usable bed.".into();
+                self.invalidate();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
     fn placement_panel(&mut self, ui: &mut egui::Ui) {
         section(ui, "PLACEMENT · MM");
         let mut draft = self.options.clone();
@@ -1111,12 +1236,10 @@ impl Studio {
             .on_hover_text("Fit the combined visible artwork with a 5 mm border.")
             .clicked()
         {
-            match self
-                .combined()
-                .and_then(|strokes| penplot::fit(&strokes, &self.profile, &mut draft, 5.0))
-            {
+            match self.fit_artwork(&mut draft) {
                 Ok(()) => {
                     changed = true;
+                    self.frame = Camera::default();
                     self.status = "Artwork fitted to the usable bed.".into();
                 }
                 Err(error) => self.status = error,
@@ -1171,7 +1294,6 @@ impl Studio {
             if ui.button("Use K9").clicked() {
                 self.profile = Profile::k9();
                 self.profile_notices.clear();
-                self.calibrated = false;
                 self.status =
                     "Loaded K9 starting values. Measure your machine before export.".into();
                 self.invalidate();
@@ -1221,21 +1343,9 @@ impl Studio {
                 .changed();
         });
         if changed {
-            self.calibrated = false;
             self.invalidate();
             ui.ctx().request_repaint();
         }
-        ui.separator();
-        section(ui, "BEFORE EXPORT");
-        ui.label("Measure Z contact, Z clearance, offsets and travel limits. Home at the printer with the pen clear; the file does not home.");
-        ui.add_enabled(
-            !changed && self.profile.validate().is_ok(),
-            egui::Checkbox::new(
-                &mut self.calibrated,
-                "I verified the profile against this machine.",
-            ),
-        );
-        ui.small("Export an air run first. Check the whole route before plotting with the pen in contact.");
         if !self.profile_notices.is_empty() {
             ui.separator();
             section(ui, "PROFILE NOTES");
@@ -1252,10 +1362,9 @@ impl Studio {
         {
             Ok((profile, notices)) => {
                 self.profile = profile;
-                self.calibrated = false;
                 self.profile_notices = notices;
                 self.status =
-                    "Profile loaded. Reconfirm the measured setup before exporting.".into();
+                    "Profile loaded. Check the measured setup before running on hardware.".into();
                 self.invalidate();
             }
             Err(error) => self.status = format!("Unable to load {}: {error}", path.display()),
@@ -1292,6 +1401,22 @@ impl Studio {
         let mut changed = ui
             .checkbox(&mut draft.optimize, "Reduce pen-up travel")
             .changed();
+        ui.horizontal(|ui| {
+            ui.label("Min image stroke (mm)");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut draft.min_image_stroke_mm)
+                        .range(0.0..=10_000.0)
+                        .speed(0.05),
+                )
+                .changed();
+        });
+        if self.raster_removed.0 > 0 {
+            ui.small(format!(
+                "Excluded {} image paths ({:.2} mm).",
+                self.raster_removed.0, self.raster_removed.1
+            ));
+        }
         let label = match draft.fill {
             Fill::None => "Outlines only",
             Fill::Lines => "Hatch lines",
@@ -1329,10 +1454,13 @@ impl Studio {
 
     fn can_export(&self) -> bool {
         self.output.is_some()
-            && self.calibrated
+            && !self.planned.is_empty()
             && !self.preview_dirty
+            && self.placement_drag.is_none()
+            && self.plan_task.is_none()
             && self.import_dialog.is_none()
             && self.import_task.is_none()
+            && !self.raster_import.is_busy()
     }
 
     fn poll_plan(&mut self, ctx: &egui::Context) {
@@ -1374,6 +1502,7 @@ impl Studio {
 
     fn update_preview(&mut self, report: PlanReport) {
         self.error = None;
+        self.raster_removed = report.removed;
         match report.result {
             Ok((planned, output)) => {
                 self.planned = planned;
@@ -1404,12 +1533,29 @@ fn combine(layers: &[Layer]) -> Result<Vec<Stroke>, String> {
 }
 
 fn calculate_plan(revision: u64, snapshot: &Snapshot, profile: &Profile) -> PlanReport {
+    let raster = snapshot
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| layer.visible)
+        .filter_map(|(index, layer)| Some((index, layer.raster.clone()?)))
+        .collect();
+    let mut removed = (0, 0.0);
     let result = combine(&snapshot.layers).and_then(|strokes| {
-        let planned = penplot::plan(&strokes, &snapshot.options)?;
-        let output = penplot::generate(&planned, profile);
-        Ok((planned, output))
+        let plan = penplot::plan_with_raster(&strokes, &snapshot.options, &raster)?;
+        removed = (plan.removed_count, plan.removed_mm);
+        let output = if plan.strokes.is_empty() {
+            Err("No drawable paths remain after filtering".into())
+        } else {
+            penplot::generate(&plan.strokes, profile)
+        };
+        Ok((plan.strokes, output))
     });
-    PlanReport { revision, result }
+    PlanReport {
+        revision,
+        result,
+        removed,
+    }
 }
 
 fn number(ui: &mut egui::Ui, label: &str, field: &mut f64, speed: f64) -> bool {
@@ -1457,7 +1603,260 @@ impl CanvasMap {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PlacementHandle {
+    Move,
+    Scale(Point),
+    Rotate(Point),
+}
+
+#[derive(Clone, Copy)]
+enum PlacementMotion {
+    Move(Point),
+    Scale(Point, f64),
+    Rotate(Point, f64),
+}
+
+impl PlacementMotion {
+    fn identity(self) -> bool {
+        match self {
+            Self::Move(shift) => shift.x.hypot(shift.y) < 1e-8,
+            Self::Scale(_, factor) => (factor - 1.0).abs() < 1e-8,
+            Self::Rotate(_, degrees) => degrees.abs() < 1e-8,
+        }
+    }
+
+    fn apply(self, point: Point) -> Point {
+        match self {
+            Self::Move(shift) => Point::new(point.x + shift.x, point.y + shift.y),
+            Self::Scale(pivot, factor) => Point::new(
+                pivot.x + (point.x - pivot.x) * factor,
+                pivot.y + (point.y - pivot.y) * factor,
+            ),
+            Self::Rotate(pivot, degrees) => {
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                let (x, y) = (point.x - pivot.x, point.y - pivot.y);
+                Point::new(pivot.x + x * cos - y * sin, pivot.y + x * sin + y * cos)
+            }
+        }
+    }
+}
+
+struct PlacementDrag {
+    bounds: [Point; 4],
+    cursor_start: Point,
+    handle: PlacementHandle,
+    before: JobOptions,
+    motion: PlacementMotion,
+}
+
+impl PlacementDrag {
+    fn update(&mut self, cursor: Point, snap: bool) {
+        let delta = Point::new(
+            cursor.x - self.cursor_start.x,
+            cursor.y - self.cursor_start.y,
+        );
+        self.motion = match self.handle {
+            PlacementHandle::Move => {
+                let shift = match snap {
+                    true if delta.x.abs() >= delta.y.abs() => Point::new(delta.x, 0.0),
+                    true => Point::new(0.0, delta.y),
+                    false => delta,
+                };
+                PlacementMotion::Move(shift)
+            }
+            PlacementHandle::Scale(pivot) => {
+                let (x, y) = (self.cursor_start.x - pivot.x, self.cursor_start.y - pivot.y);
+                let denominator = x * x + y * y;
+                if denominator <= f64::EPSILON {
+                    return;
+                }
+                let factor = 1.0 + (delta.x * x + delta.y * y) / denominator;
+                let min = 1e-8_f64.min(self.before.scale) / self.before.scale;
+                PlacementMotion::Scale(pivot, factor.clamp(min, 1e8 / self.before.scale))
+            }
+            PlacementHandle::Rotate(pivot) => {
+                let angle = |p: Point| (p.y - pivot.y).atan2(p.x - pivot.x);
+                let mut degrees = ((angle(cursor) - angle(self.cursor_start)).to_degrees() + 180.0)
+                    .rem_euclid(360.0)
+                    - 180.0;
+                if snap {
+                    degrees = (degrees / 15.0).round() * 15.0;
+                }
+                PlacementMotion::Rotate(pivot, degrees)
+            }
+        };
+    }
+
+    fn options(self, layers: &[Layer]) -> Option<JobOptions> {
+        let mut opts = self.before;
+        let left_bottom = Point::new(opts.x, opts.y);
+        match self.motion {
+            PlacementMotion::Move(_) => {
+                let p = self.motion.apply(left_bottom);
+                opts.x = p.x;
+                opts.y = p.y;
+            }
+            PlacementMotion::Scale(_, factor) => {
+                let p = self.motion.apply(left_bottom);
+                opts.x = p.x;
+                opts.y = p.y;
+                opts.scale *= factor;
+            }
+            PlacementMotion::Rotate(_, degrees) => {
+                let (old_sin, old_cos) = opts.rotation_deg.rem_euclid(360.0).to_radians().sin_cos();
+                let raw_lo = projected_min(layers, opts.scale, old_sin, old_cos)?;
+                let raw_origin = Point::new(opts.x - raw_lo.x, opts.y - raw_lo.y);
+                let rotated_origin = self.motion.apply(raw_origin);
+                opts.rotation_deg = (opts.rotation_deg + degrees).rem_euclid(360.0);
+                let (sin, cos) = opts.rotation_deg.to_radians().sin_cos();
+                let new_lo = projected_min(layers, opts.scale, sin, cos)?;
+                opts.x = rotated_origin.x + new_lo.x;
+                opts.y = rotated_origin.y + new_lo.y;
+            }
+        }
+        [opts.x, opts.y, opts.scale, opts.rotation_deg]
+            .into_iter()
+            .all(f64::is_finite)
+            .then_some(opts)
+    }
+}
+
+fn rotate_handle(points: [Pos2; 4]) -> Pos2 {
+    let top = points[2].lerp(points[3], 0.5);
+    let center = points[0].lerp(points[2], 0.5);
+    let direction = (top - center).normalized();
+    top + if direction == Vec2::ZERO {
+        egui::vec2(0.0, -24.0)
+    } else {
+        direction * 24.0
+    }
+}
+
+fn draw_placement_handles(painter: &egui::Painter, map: CanvasMap, bounds: [Point; 4], tool: Tool) {
+    let points = bounds.map(|point| map.screen(point));
+    let color = Color32::from_rgb(30, 125, 111);
+    painter.add(egui::Shape::closed_line(
+        points.to_vec(),
+        Ink::new(1.4, color),
+    ));
+    match tool {
+        Tool::Scale => {
+            for point in points {
+                painter.rect_filled(Rect::from_center_size(point, Vec2::splat(9.0)), 2.0, color);
+            }
+        }
+        Tool::Rotate => {
+            let handle = rotate_handle(points);
+            painter.line_segment(
+                [points[2].lerp(points[3], 0.5), handle],
+                Ink::new(1.4, color),
+            );
+            painter.circle_filled(handle, 5.0, color);
+        }
+        _ => {}
+    }
+}
+
 impl Studio {
+    fn placement_bounds(&mut self) -> Option<[Point; 4]> {
+        if let Some((revision, result)) = self.placement_bounds_cache
+            && revision == self.revision
+        {
+            return result;
+        }
+        let opts = &self.options;
+        let (sin, cos) = opts.rotation_deg.rem_euclid(360.0).to_radians().sin_cos();
+        let result = if opts.scale > 0.0
+            && [opts.scale, opts.x, opts.y, sin, cos]
+                .into_iter()
+                .all(|value| value.is_finite() && value.abs() <= 1e8)
+        {
+            projected_bounds(&self.layers, opts.scale, sin, cos).and_then(|(lo, hi)| {
+                let (left, bottom) = (opts.x, opts.y);
+                let (right, top) = (left + hi.x - lo.x, bottom + hi.y - lo.y);
+                (right.is_finite() && top.is_finite()).then_some([
+                    Point::new(left, bottom),
+                    Point::new(right, bottom),
+                    Point::new(right, top),
+                    Point::new(left, top),
+                ])
+            })
+        } else {
+            None
+        };
+        self.placement_bounds_cache = Some((self.revision, result));
+        result
+    }
+
+    fn handle_placement(&mut self, ui: &egui::Ui, response: &egui::Response, map: CanvasMap) {
+        let primary = egui::PointerButton::Primary;
+        if self.placement_drag.is_none()
+            && response.drag_started_by(primary)
+            && self.import_task.is_none()
+            && self.import_dialog.is_none()
+            && let Some(press) = ui.input(|input| input.pointer.press_origin())
+            && let Some(bounds) = self.placement_bounds()
+        {
+            let corners = bounds.map(|point| map.screen(point));
+            let near = |point: Pos2| press.distance(point) <= 11.0;
+            let handle = match self.tools {
+                Tool::Move
+                    if Rect::from_two_pos(corners[0], corners[2])
+                        .expand(9.0)
+                        .contains(press) =>
+                {
+                    Some(PlacementHandle::Move)
+                }
+                Tool::Scale => corners
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, corner)| near(**corner))
+                    .min_by(|(_, a), (_, b)| press.distance(**a).total_cmp(&press.distance(**b)))
+                    .and_then(|(i, _)| {
+                        (corners[i].distance(corners[(i + 2) % 4]) > 0.2)
+                            .then_some(PlacementHandle::Scale(bounds[(i + 2) % 4]))
+                    }),
+                Tool::Rotate if near(rotate_handle(corners)) => {
+                    Some(PlacementHandle::Rotate(Point::new(
+                        (bounds[0].x + bounds[2].x) * 0.5,
+                        (bounds[0].y + bounds[2].y) * 0.5,
+                    )))
+                }
+                _ => None,
+            };
+            if let Some(handle) = handle {
+                self.play = false;
+                self.shown = self.planned.len();
+                self.placement_drag = Some(PlacementDrag {
+                    bounds,
+                    cursor_start: map.paper(press),
+                    handle,
+                    before: self.options.clone(),
+                    motion: PlacementMotion::Move(Point::new(0.0, 0.0)),
+                });
+            }
+        }
+        if let Some(drag) = &mut self.placement_drag
+            && let Some(cursor) = ui.input(|input| input.pointer.interact_pos())
+        {
+            drag.update(map.paper(cursor), ui.input(|input| input.modifiers.shift));
+        }
+        if response.drag_stopped_by(primary)
+            && let Some(drag) = self.placement_drag.take()
+            && !drag.motion.identity()
+            && let Some(opts) = drag.options(&self.layers)
+        {
+            self.record_layers();
+            self.options = opts;
+            self.invalidate();
+            ui.ctx().request_repaint();
+        }
+        if !ui.input(|input| input.pointer.button_down(primary)) {
+            self.placement_drag = None;
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.isometric, false, "2D");
@@ -1476,27 +1875,53 @@ impl Studio {
             }
             for tool in [
                 Tool::Pan,
+                Tool::Move,
+                Tool::Scale,
+                Tool::Rotate,
                 Tool::Line,
                 Tool::Rectangle,
                 Tool::Ellipse,
                 Tool::Freehand,
             ] {
                 if ui
-                    .selectable_label(self.tools == tool, tool.label())
+                    .selectable_label(self.tools == tool, tool.label_localized(self.japanese))
                     .clicked()
                 {
                     self.tools = tool;
                     self.draft.clear();
+                    self.placement_drag = None;
                 }
             }
             ui.separator();
             if ui.button("Reset view").clicked() {
                 self.frame = Camera::default();
             }
-            ui.label(RichText::new("Wheel: zoom   ·   Middle drag: pan").weak());
+            if ui
+                .add_enabled(
+                    self.placement_drag.is_none() && self.layers.iter().any(|layer| layer.visible),
+                    egui::Button::new(if self.japanese {
+                        "ベッドに合わせる"
+                    } else {
+                        "Fit to bed"
+                    }),
+                )
+                .on_hover_text("Fit the visible artwork with a 5 mm margin and reset the camera.")
+                .clicked()
+            {
+                self.fit_and_reset_view();
+                ui.ctx().request_repaint();
+            }
+            let hint = match self.tools {
+                Tool::Move => "Drag the frame or artwork · Shift: one axis · Esc: cancel",
+                Tool::Scale => "Drag a corner · Esc: cancel",
+                Tool::Rotate => "Drag the circular handle · Shift: 15° steps · Esc: cancel",
+                _ => "Wheel: zoom · Middle drag: pan",
+            };
+            ui.label(RichText::new(hint).weak());
         });
         if self.isometric {
             self.draft.clear();
+            self.placement_drag = None;
             self.isometric_canvas(ui);
             return;
         }
@@ -1522,7 +1947,9 @@ impl Studio {
                 scale,
             }
         };
-        if let Some(pointer) = response.hover_pos() {
+        if self.placement_drag.is_none()
+            && let Some(pointer) = response.hover_pos()
+        {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let before = camera_map(&self.frame).paper(pointer);
@@ -1533,7 +1960,7 @@ impl Studio {
         }
         let panning = response.dragged_by(egui::PointerButton::Middle)
             || (self.tools == Tool::Pan && response.dragged_by(egui::PointerButton::Primary));
-        if panning {
+        if panning && self.placement_drag.is_none() {
             self.frame.shift += response.drag_delta();
         }
         let map = camera_map(&self.frame);
@@ -1576,7 +2003,7 @@ impl Studio {
             [center - egui::vec2(0.0, 6.0), center + egui::vec2(0.0, 6.0)],
             Ink::new(1.5, Color32::DARK_RED),
         );
-        if self.planned.is_empty()
+        if !self.layers.iter().any(|layer| layer.visible)
             && self.error.is_none()
             && self.import_task.is_none()
             && self.plan_task.is_none()
@@ -1589,9 +2016,27 @@ impl Studio {
                 Color32::from_rgb(78, 93, 91),
             );
         }
-        self.paint_route(&painter, map);
-        if self.tools != Tool::Pan {
-            self.draw_on_bed(ui, &response, &painter, map);
+        if self.tools.placement() {
+            self.handle_placement(ui, &response, map);
+            if let Some(drag) = &self.placement_drag {
+                self.paint_route_transformed(&painter, map, |point| drag.motion.apply(point));
+                draw_placement_handles(
+                    &painter,
+                    map,
+                    drag.bounds.map(|point| drag.motion.apply(point)),
+                    self.tools,
+                );
+            } else {
+                self.paint_route(&painter, map);
+                if let Some(bounds) = self.placement_bounds() {
+                    draw_placement_handles(&painter, map, bounds, self.tools);
+                }
+            }
+        } else {
+            self.paint_route(&painter, map);
+            if self.tools != Tool::Pan {
+                self.draw_on_bed(ui, &response, &painter, map);
+            }
         }
         if let Some(at) = response.hover_pos() {
             let point = map.paper(at);
@@ -1767,13 +2212,22 @@ impl Studio {
     }
 
     fn paint_route(&self, painter: &egui::Painter, map: CanvasMap) {
+        self.paint_route_transformed(painter, map, |point| point);
+    }
+
+    fn paint_route_transformed(
+        &self,
+        painter: &egui::Painter,
+        map: CanvasMap,
+        transform: impl Fn(Point) -> Point,
+    ) {
         let mut previous = None;
         let clipped = painter.clip_rect().expand(2.0);
         for (index, stroke) in self.planned.iter().enumerate() {
             let Some(&first) = stroke.points.first() else {
                 continue;
             };
-            let start = map.screen(first);
+            let start = map.screen(transform(first));
             let active = index < self.shown;
             if active
                 && self.show_travel
@@ -1794,7 +2248,7 @@ impl Studio {
             let ink = Ink::new(if active { 1.7 } else { 1.25 }, color);
             let mut last = start;
             for &point in &stroke.points[1..] {
-                let next = map.screen(point);
+                let next = map.screen(transform(point));
                 if Rect::from_two_pos(last, next).intersects(clipped) {
                     painter.line_segment([last, next], ink);
                 }
@@ -1936,6 +2390,7 @@ impl Studio {
             name: "Canvas marks".into(),
             strokes: strokes.into(),
             visible: true,
+            raster: None,
         });
         self.selected = Some(self.layers.len() - 1);
         self.status = format!("Added {} mark. Undo removes it.", self.tools.label());
@@ -2045,18 +2500,29 @@ fn trace_segments(strokes: &[Stroke], up: f64, down: f64, mut emit: impl FnMut(T
 }
 
 fn projected_min(layers: &[Layer], scale: f64, sin: f64, cos: f64) -> Option<Point> {
-    let mut x = f64::INFINITY;
-    let mut y = f64::INFINITY;
+    projected_bounds(layers, scale, sin, cos).map(|(lo, _)| lo)
+}
+
+fn projected_bounds(layers: &[Layer], scale: f64, sin: f64, cos: f64) -> Option<(Point, Point)> {
+    let mut lo = Point::new(f64::INFINITY, f64::INFINITY);
+    let mut hi = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
     for point in layers
         .iter()
         .filter(|layer| layer.visible)
         .flat_map(|layer| layer.strokes.iter())
         .flat_map(|stroke| stroke.points.iter())
     {
-        x = x.min((point.x * cos - point.y * sin) * scale);
-        y = y.min((point.x * sin + point.y * cos) * scale);
+        let x = (point.x * cos - point.y * sin) * scale;
+        let y = (point.x * sin + point.y * cos) * scale;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        lo.x = lo.x.min(x);
+        lo.y = lo.y.min(y);
+        hi.x = hi.x.max(x);
+        hi.y = hi.y.max(y);
     }
-    (x.is_finite() && y.is_finite()).then(|| Point::new(x, y))
+    lo.x.is_finite().then_some((lo, hi))
 }
 
 fn format_mm(value: f64) -> String {
@@ -2103,7 +2569,7 @@ fn draft_geometry(tool: Tool, points: &[Point]) -> Option<(Vec<Point>, bool)> {
     let dx = last.x - first.x;
     let dy = last.y - first.y;
     let line = match tool {
-        Tool::Pan => return None,
+        Tool::Pan | Tool::Move | Tool::Scale | Tool::Rotate => return None,
         Tool::Freehand if points.len() >= 2 => {
             let distinct = points
                 .iter()
@@ -2218,16 +2684,15 @@ mod tests {
     }
 
     #[test]
-    fn export_requires_current_valid_route_and_session_calibration() {
+    fn export_requires_current_valid_route_without_a_manual_confirmation() {
         let mut app = Studio::default();
         assert!(app.air_first);
         assert!(!app.can_export());
         app.add_mark(vec![Point::new(10.0, 10.0), Point::new(25.0, 10.0)], false)
             .unwrap();
         app.rebuild();
-        assert!(!app.can_export());
-        app.calibrated = true;
         assert!(app.can_export());
+        assert!(penplot::generate_air_run(&app.planned, &app.profile).is_ok());
         let old_report = calculate_plan(app.revision, &app.snapshot(), &app.profile);
         let (sender, receiver) = mpsc::channel();
         sender.send(old_report).unwrap();
@@ -2242,13 +2707,12 @@ mod tests {
     }
 
     #[test]
-    fn loading_project_discards_history_and_resets_the_session_gate() {
+    fn loading_project_discards_history_and_waits_for_current_geometry() {
         let mut original = Studio::default();
         original
             .add_mark(vec![Point::new(10.0, 10.0), Point::new(42.0, 10.0)], false)
             .unwrap();
         original.rebuild();
-        original.calibrated = true;
         let project = Project::from_json(&original.as_project().to_json().unwrap()).unwrap();
         original.air_first = false;
         assert!(original.can_export());
@@ -2260,7 +2724,209 @@ mod tests {
         assert!(original.undo.is_empty());
         assert_eq!(original.layers.len(), 1);
         original.rebuild();
-        assert!(!original.can_export());
+        assert!(original.can_export());
+    }
+
+    #[test]
+    fn placement_rotation_preserves_visible_artwork_and_uses_shift_snap() {
+        let mut app = Studio::default();
+        app.add_mark(
+            vec![
+                Point::new(10.0, 10.0),
+                Point::new(35.0, 10.0),
+                Point::new(10.0, 18.0),
+            ],
+            true,
+        )
+        .unwrap();
+        let hidden_stroke = Stroke {
+            points: vec![Point::new(-900.0, -900.0), Point::new(500.0, 500.0)],
+            layer: "Hidden".into(),
+            group: 0,
+            closed: false,
+            filled: false,
+        };
+        app.layers.push(Layer {
+            name: "Hidden".into(),
+            strokes: vec![hidden_stroke].into(),
+            raster: None,
+            visible: false,
+        });
+        app.invalidate();
+        app.rebuild();
+        let before = app.planned[0].points.clone();
+        let bounds = app.placement_bounds().unwrap();
+        assert_eq!(bounds[0], Point::new(10.0, 10.0));
+        assert_eq!(bounds[2], Point::new(35.0, 18.0));
+        let pivot = Point::new(22.5, 14.0);
+        let mut drag = PlacementDrag {
+            bounds,
+            cursor_start: Point::new(22.5, 25.0),
+            handle: PlacementHandle::Rotate(pivot),
+            before: app.options.clone(),
+            motion: PlacementMotion::Rotate(pivot, 0.0),
+        };
+        drag.update(Point::new(14.5, 22.0), true);
+        let intended: Vec<_> = before.into_iter().map(|p| drag.motion.apply(p)).collect();
+        app.options = drag.options(&app.layers).unwrap();
+        assert_eq!(app.options.rotation_deg, 45.0);
+        app.invalidate();
+        app.rebuild();
+        for (point, expected) in app.planned[0].points.iter().zip(intended) {
+            assert!((point.x - expected.x).hypot(point.y - expected.y) < 1e-8);
+        }
+    }
+
+    #[test]
+    fn placement_scale_fixes_opposite_corner_and_keeps_positive_scale() {
+        let pivot = Point::new(20.0, 20.0);
+        let mut drag = PlacementDrag {
+            bounds: [pivot; 4],
+            cursor_start: Point::new(30.0, 30.0),
+            handle: PlacementHandle::Scale(pivot),
+            before: JobOptions {
+                x: 20.0,
+                y: 20.0,
+                ..JobOptions::default()
+            },
+            motion: PlacementMotion::Scale(pivot, 1.0),
+        };
+        drag.update(Point::new(40.0, 40.0), false);
+        assert_eq!(drag.motion.apply(pivot), pivot);
+        assert_eq!(drag.motion.apply(drag.cursor_start), Point::new(40.0, 40.0));
+        drag.update(Point::new(5.0, 5.0), false);
+        let opts = drag.options(&[]).unwrap();
+        assert!(opts.scale > 0.0);
+        assert_eq!((opts.x, opts.y), (20.0, 20.0));
+    }
+
+    #[test]
+    fn active_placement_blocks_export_but_escape_does_not_dirty_job() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(22.0, 20.0)], false)
+            .unwrap();
+        app.rebuild();
+        app.project_dirty = false;
+        let revision = app.revision;
+        let history = app.undo.len();
+        let original = app.options.clone();
+        let bounds = app.placement_bounds().unwrap();
+        let mut drag = PlacementDrag {
+            bounds,
+            cursor_start: bounds[0],
+            handle: PlacementHandle::Move,
+            before: original.clone(),
+            motion: PlacementMotion::Move(Point::new(0.0, 0.0)),
+        };
+        drag.update(Point::new(bounds[0].x + 3.0, bounds[0].y + 5.0), true);
+        assert_eq!(
+            drag.motion.apply(bounds[0]),
+            Point::new(bounds[0].x, bounds[0].y + 5.0)
+        );
+        app.placement_drag = Some(drag);
+        assert!(!app.can_export());
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: Some(Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.update_ui(ctx),
+        );
+        assert!(app.placement_drag.is_none());
+        assert!(app.can_export());
+        assert_eq!(app.revision, revision);
+        assert_eq!(app.options.x, original.x);
+        assert_eq!(app.options.y, original.y);
+        assert_eq!(app.undo.len(), history);
+        assert!(!app.project_dirty);
+    }
+
+    #[test]
+    fn one_pointer_move_drag_commits_one_undo_step() {
+        let ctx = egui::Context::default();
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(30.0, 30.0), Point::new(65.0, 60.0)], false)
+            .unwrap();
+        app.rebuild();
+        app.tools = Tool::Move;
+        let history = app.undo.len();
+        let draw = |app: &mut Studio, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1100.0, 820.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.canvas(ui));
+                },
+            )
+        };
+        let output = draw(&mut app, vec![]);
+        let paper = output
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Rect(shape) if shape.fill == PAPER => Some(shape.rect),
+                _ => None,
+            })
+            .unwrap();
+        let from = paper.center();
+        let to = from + egui::vec2(35.0, -26.0);
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(from), pointer(from, true)],
+        );
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(from.lerp(to, 0.5))],
+        );
+        assert!(app.placement_drag.is_some());
+        assert_eq!(app.undo.len(), history);
+        assert!(!app.can_export());
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(to), pointer(to, false)],
+        );
+        assert!(app.placement_drag.is_none());
+        assert_eq!(app.undo.len(), history + 1);
+        assert!((app.options.x - (30.0 + 3500.0 / f64::from(paper.width()))).abs() < 0.001);
+        assert!((app.options.y - (30.0 + 2600.0 / f64::from(paper.height()))).abs() < 0.001);
+        assert!(!app.can_export());
+        let moved_x = app.options.x;
+        app.undo();
+        assert_eq!((app.options.x, app.options.y), (30.0, 30.0));
+        app.redo();
+        assert_eq!(app.options.x, moved_x);
+    }
+
+    #[test]
+    fn fit_uses_five_mm_margin_and_resets_camera() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(30.0, 20.0)], false)
+            .unwrap();
+        app.frame.zoom = 3.0;
+        app.frame.shift = egui::vec2(20.0, -10.0);
+        app.fit_and_reset_view();
+        let bounds = app.placement_bounds().unwrap();
+        assert_eq!(bounds[0], Point::new(5.0, 27.5));
+        assert_eq!(bounds[2], Point::new(95.0, 72.5));
+        assert_eq!(app.frame.zoom, 1.0);
+        assert_eq!(app.frame.shift, Vec2::ZERO);
+        assert!(!app.show_travel);
     }
 
     #[test]

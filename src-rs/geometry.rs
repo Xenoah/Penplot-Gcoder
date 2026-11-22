@@ -6,8 +6,11 @@ use std::collections::BTreeMap;
 #[serde(rename_all = "snake_case")]
 pub enum Fill {
     #[default]
+    #[serde(alias = "outline", alias = "outline_only")]
     None,
+    #[serde(alias = "hatch", alias = "hatch_fill")]
     Lines,
+    #[serde(alias = "cross_hatch")]
     Cross,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +25,8 @@ pub struct JobOptions {
     pub fill: Fill,
     pub hatch_spacing: f64,
     pub hatch_angle: f64,
+    #[serde(default, skip_serializing_if = "is_zero", alias = "min_image_stroke")]
+    pub min_image_stroke_mm: f64,
 }
 impl Default for JobOptions {
     fn default() -> Self {
@@ -34,9 +39,63 @@ impl Default for JobOptions {
             fill: Fill::None,
             hatch_spacing: 1.,
             hatch_angle: 45.,
+            min_image_stroke_mm: 0.,
         }
     }
 }
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// Raster settings saved independently of the source image.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RasterSettings {
+    #[serde(alias = "mode", alias = "fill_mode")]
+    pub fill: Fill,
+    #[serde(alias = "spacing", alias = "hatch_spacing_mm")]
+    pub hatch_spacing: f64,
+    #[serde(alias = "angle", alias = "hatch_angle_deg")]
+    pub hatch_angle: f64,
+}
+
+impl Default for RasterSettings {
+    fn default() -> Self {
+        Self {
+            fill: Fill::None,
+            hatch_spacing: 1.,
+            hatch_angle: 45.,
+        }
+    }
+}
+
+impl RasterSettings {
+    pub fn from_job(o: &JobOptions) -> Self {
+        Self {
+            fill: o.fill,
+            hatch_spacing: o.hatch_spacing,
+            hatch_angle: o.hatch_angle,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.hatch_angle.is_finite() && (0.02..=1000.).contains(&self.hatch_spacing) {
+            Ok(())
+        } else {
+            Err("Hatch spacing must be 0.02 to 1000 mm; angle must be finite".into())
+        }
+    }
+}
+
+pub type RasterLayers = BTreeMap<usize, RasterSettings>;
+
+#[derive(Debug)]
+pub struct PlanResult {
+    pub strokes: Vec<Stroke>,
+    pub removed_count: usize,
+    pub removed_mm: f64,
+}
+
 #[derive(Clone, Copy)]
 struct Bounds {
     lo: Point,
@@ -115,6 +174,25 @@ pub fn fit(
 }
 
 pub fn plan(strokes: &[Stroke], o: &JobOptions) -> Result<Vec<Stroke>, String> {
+    plan_with_raster(strokes, o, &RasterLayers::new()).map(|result| result.strokes)
+}
+
+pub fn plan_with_raster(
+    strokes: &[Stroke],
+    o: &JobOptions,
+    layers: &RasterLayers,
+) -> Result<PlanResult, String> {
+    if !(0.0..=10_000.).contains(&o.min_image_stroke_mm) {
+        return Err("Minimum image stroke must be 0 to 10000 mm".into());
+    }
+    for settings in layers.values() {
+        settings.validate()?;
+    }
+    let raster = |layer: &str| -> Option<&RasterSettings> {
+        let (prefix, _) = layer.split_once(':')?;
+        layers.get(&prefix.parse::<usize>().ok()?)
+    };
+    let job = RasterSettings::from_job(o);
     let b = rotated_bounds(strokes, o.rotation_deg)?;
     if ![o.scale, o.x, o.y]
         .iter()
@@ -155,10 +233,14 @@ pub fn plan(strokes: &[Stroke], o: &JobOptions) -> Result<Vec<Stroke>, String> {
         return Err("All visible paths have zero length".into());
     }
     check_size(&out)?;
-    if o.fill != Fill::None {
+    if o.fill != Fill::None || layers.values().any(|r| r.fill != Fill::None) {
         let mut groups: BTreeMap<(&str, u32), Vec<&Stroke>> = BTreeMap::new();
         for s in &out {
-            if s.filled && s.closed && s.points.len() >= 4 {
+            if s.filled
+                && s.closed
+                && s.points.len() >= 4
+                && raster(&s.layer).unwrap_or(&job).fill != Fill::None
+            {
                 groups.entry((&s.layer, s.group)).or_default().push(s);
             }
         }
@@ -168,23 +250,24 @@ pub fn plan(strokes: &[Stroke], o: &JobOptions) -> Result<Vec<Stroke>, String> {
             .saturating_sub(out.len())
             .min((MAX_POINTS - out.iter().map(|s| s.points.len()).sum::<usize>()) / 2);
         for ((layer, group), rings) in groups {
+            let settings = raster(layer).unwrap_or(&job);
             hatch(
                 &rings,
                 layer,
                 group,
-                o.hatch_spacing,
-                o.hatch_angle,
+                settings.hatch_spacing,
+                settings.hatch_angle,
                 &mut fill,
                 &mut budget,
                 allowed,
             )?;
-            if o.fill == Fill::Cross {
+            if settings.fill == Fill::Cross {
                 hatch(
                     &rings,
                     layer,
                     group,
-                    o.hatch_spacing,
-                    o.hatch_angle + 90.,
+                    settings.hatch_spacing,
+                    settings.hatch_angle + 90.,
                     &mut fill,
                     &mut budget,
                     allowed,
@@ -193,10 +276,32 @@ pub fn plan(strokes: &[Stroke], o: &JobOptions) -> Result<Vec<Stroke>, String> {
         }
         out.extend(fill);
     }
+    let mut removed_count = 0;
+    let mut removed_mm = 0.0;
+    if o.min_image_stroke_mm > 0.0 && !layers.is_empty() {
+        out.retain(|stroke| {
+            if raster(&stroke.layer).is_none() {
+                return true;
+            }
+            let length: f64 = stroke.points.windows(2).map(|p| p[0].distance(p[1])).sum();
+            let slack = 1e-10 * o.min_image_stroke_mm;
+            if length < o.min_image_stroke_mm - slack {
+                removed_count += 1;
+                removed_mm += length;
+                false
+            } else {
+                true
+            }
+        });
+    }
     if o.optimize {
         optimize_runs(&mut out);
     }
-    Ok(out)
+    Ok(PlanResult {
+        strokes: out,
+        removed_count,
+        removed_mm,
+    })
 }
 /// Even/odd clipping across the rings of ONE compound shape, never across unrelated objects.
 /// Scanline intersections use half-open edges (a polygon vertex must not be counted twice).

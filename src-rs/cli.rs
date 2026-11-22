@@ -21,6 +21,7 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --x MM, --y MM       lower-left of rotated artwork bounds on paper
   --hatch lines|cross  outlined and hatched filled, closed shapes
   --spacing MM         hatch spacing (default 1); --angle DEG (default 45)
+  --min-image-stroke MM omit raster strokes shorter than MM after placement (0 = off)
   --optimize           reduce lifts' travel within contiguous layer runs
   --dpi N              PNG/JPEG physical scale (default 96)
   --threshold 0..255   raster foreground brightness cutoff (default 128)
@@ -106,12 +107,20 @@ fn run(mut it: Args) -> Result<(), String> {
     let (mut calibrated, mut air, mut placement, mut margin) = (false, false, false, None);
     let mut files = Vec::new();
     let mut supplied_job_settings = false;
+    let mut minimum = None;
     while let Some(arg) = it.next() {
         let flag = arg.to_str().unwrap_or("");
         if flag.starts_with('-')
             && !matches!(
                 flag,
-                "--help" | "-h" | "--" | "--output" | "-o" | "--calibrated" | "--air-run"
+                "--help"
+                    | "-h"
+                    | "--"
+                    | "--output"
+                    | "-o"
+                    | "--calibrated"
+                    | "--air-run"
+                    | "--min-image-stroke"
             )
         {
             supplied_job_settings = true;
@@ -143,6 +152,7 @@ fn run(mut it: Args) -> Result<(), String> {
                 placement = true;
             }
             "--rotate" => opts.rotation_deg = num(&mut it, "--rotate")?,
+            "--min-image-stroke" => minimum = Some(num(&mut it, "--min-image-stroke")?),
             "--optimize" => opts.optimize = true,
             "--hatch" => {
                 opts.fill = match value(&mut it, "--hatch")?.to_str() {
@@ -192,10 +202,14 @@ fn run(mut it: Args) -> Result<(), String> {
         return Err("check does not write files; use convert".into());
     }
     let mut strokes = Vec::new();
+    let mut raster = penplot::RasterLayers::new();
     let p = if is_project {
         let project = penplot::Project::from_json(&penplot::read_limited(&files[0])?)?;
         for (index, layer) in project.layers.iter().enumerate().filter(|(_, l)| l.visible) {
             penplot::append_layer(&mut strokes, &layer.strokes, index)?;
+            if let Some(settings) = layer.raster_settings(&project.options) {
+                raster.insert(index, settings);
+            }
         }
         opts = project.options;
         project.profile
@@ -211,6 +225,9 @@ fn run(mut it: Args) -> Result<(), String> {
                 eprintln!("Warning [{}]: {w}", path.display());
             }
             penplot::append_layer(&mut strokes, &art.strokes, index)?;
+            if penplot::is_raster_filename(&path.to_string_lossy()) {
+                raster.insert(index, penplot::RasterSettings::from_job(&opts));
+            }
         }
         profile
             .map(|path| load_profile(&path))
@@ -220,7 +237,20 @@ fn run(mut it: Args) -> Result<(), String> {
     if let Some(m) = margin {
         penplot::fit(&strokes, &p, &mut opts, m)?;
     }
-    let routes = penplot::plan(&strokes, &opts)?;
+    if let Some(minimum) = minimum {
+        opts.min_image_stroke_mm = minimum;
+    }
+    let plan = penplot::plan_with_raster(&strokes, &opts, &raster)?;
+    if plan.removed_count > 0 {
+        eprintln!(
+            "Excluded {} image paths ({:.2} mm).",
+            plan.removed_count, plan.removed_mm
+        );
+    }
+    let routes = plan.strokes;
+    if routes.is_empty() {
+        return Err("No drawable paths remain after filtering".into());
+    }
     let program = if air {
         penplot::generate_air_run(&routes, &p)
     } else {

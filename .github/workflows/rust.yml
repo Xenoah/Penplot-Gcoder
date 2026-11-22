@@ -25,13 +25,20 @@ jobs:
       - name: Inspect sample without a machine
         if: runner.os == 'Windows'
         run: ./target/release/penplot.exe check --fit 5 examples/alignment-card.svg
+      - name: Read archive version
+        if: runner.os == 'Windows'
+        id: package-name
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
+          echo "name=Penplot-Studio-v${version}-Windows-x64" >> "$GITHUB_OUTPUT"
       - name: Package Windows binaries, examples and attributions
         if: runner.os == 'Windows'
-        run: python scripts/package-windows.py x86_64-pc-windows-msvc target/release Penplot-Studio-Windows-x64.zip
+        run: python scripts/package-windows.py x86_64-pc-windows-msvc target/release ${{ steps.package-name.outputs.name }}.zip
       - name: Archive portable Windows binaries
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: Penplot-Studio-Windows-x64
-          path: Penplot-Studio-Windows-x64.zip
+          name: ${{ steps.package-name.outputs.name }}
+          path: ${{ steps.package-name.outputs.name }}.zip
           if-no-files-found: error

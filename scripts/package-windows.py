@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 import zipfile
 
 
@@ -66,6 +67,8 @@ def main():
         if Path(name).exists():
             files[name] = Path(name)
     docs = {name: file.read_bytes() for name, file in files.items()}
+    version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    docs["VERSION.txt"] = f"Penplot-Gcoder Studio v{version}\nTarget: {target}\n".encode("utf-8")
     docs["THIRD-PARTY-NOTICES.txt"] = notices(target).encode()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for name, data in sorted(docs.items()):

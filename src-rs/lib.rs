@@ -8,7 +8,9 @@ mod import_raster;
 mod import_vector;
 mod machine;
 mod project;
-pub use geometry::{Fill, JobOptions, fit, plan};
+pub use geometry::{
+    Fill, JobOptions, PlanResult, RasterLayers, RasterSettings, fit, plan, plan_with_raster,
+};
 pub use machine::{Origin, Output, Profile, generate, generate_air_run};
 pub use project::{Project, ProjectLayer};
 
@@ -77,6 +79,17 @@ pub fn read_limited(path: &Path) -> Result<Vec<u8>, String> {
         return Err("File exceeds 16 MiB".into());
     }
     Ok(buf)
+}
+
+pub fn is_raster_filename(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|ext| {
+            ["png", "jpg", "jpeg"]
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(ext))
+        })
 }
 
 pub fn import_bytes(filename: &str, bytes: &[u8], opts: &ImportOptions) -> Result<Artwork, String> {

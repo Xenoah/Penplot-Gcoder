@@ -261,11 +261,13 @@ fn cli_project_roundtrip_matches_visible_gui_layer_route() {
     let mut project = Project {
         layers: vec![
             ProjectLayer {
+                raster: None,
                 name: "visible".into(),
                 visible: true,
                 strokes: vec![rect(0., 0., 5., 5., 1)],
             },
             ProjectLayer {
+                raster: None,
                 name: "hidden".into(),
                 visible: false,
                 strokes: vec![rect(-200., 0., 0., 50., 1)],
@@ -306,4 +308,76 @@ fn cli_project_roundtrip_matches_visible_gui_layer_route() {
     project.layers[0].visible = false;
     std::fs::write(dir.path().join("blank.penplot"), project.to_json().unwrap()).unwrap();
     assert!(!sh(&["check", "blank.penplot"]).status.success());
+}
+
+#[test]
+fn raster_filter_keeps_placement_and_unrelated_short_vectors() {
+    let mut image = rect(0., 0., 0.1, 0.1, 1);
+    image.layer = "Raster contours".into();
+    let mut long = rect(10., 10., 12., 12., 2);
+    long.layer = "Raster contours".into();
+    let vector = rect(4., 4., 4.1, 4.1, 1);
+    let mut strokes = vec![];
+    penplot::append_layer(&mut strokes, &[image, long], 0).unwrap();
+    penplot::append_layer(&mut strokes, &[vector], 1).unwrap();
+    let raster = penplot::RasterLayers::from([(0, Default::default())]);
+    let mut opts = JobOptions {
+        x: 20.,
+        y: 30.,
+        scale: 2.,
+        ..Default::default()
+    };
+    let old = penplot::plan_with_raster(&strokes, &opts, &raster).unwrap();
+    opts.min_image_stroke_mm = 1.;
+    let reduced = penplot::plan_with_raster(&strokes, &opts, &raster).unwrap();
+    assert_eq!(reduced.removed_count, 1);
+    assert_eq!(reduced.strokes, old.strokes[1..]);
+    opts.min_image_stroke_mm = 0.8;
+    assert_eq!(
+        penplot::plan_with_raster(&strokes, &opts, &raster)
+            .unwrap()
+            .removed_count,
+        0
+    );
+    opts.scale = 4.;
+    opts.min_image_stroke_mm = 1.;
+    assert_eq!(
+        penplot::plan_with_raster(&strokes, &opts, &raster)
+            .unwrap()
+            .removed_count,
+        0
+    );
+}
+
+#[test]
+fn raster_cutoff_does_not_restore_hatch_inside_a_removed_hole() {
+    let outer = rect(0., 0., 4., 4., 3);
+    let inner = rect(1.95, 2.075, 2.05, 2.175, 3);
+    let mut sources = vec![];
+    penplot::append_layer(&mut sources, &[outer, inner], 0).unwrap();
+    let raster = penplot::RasterLayers::from([(
+        0,
+        penplot::RasterSettings {
+            fill: Fill::Lines,
+            hatch_spacing: 0.25,
+            hatch_angle: 0.0,
+        },
+    )]);
+    let opts = JobOptions {
+        min_image_stroke_mm: 0.5,
+        ..Default::default()
+    };
+    let filtered = penplot::plan_with_raster(&sources, &opts, &raster).unwrap();
+    assert_eq!(filtered.removed_count, 1);
+    let hatch_at_hole: Vec<_> = filtered
+        .strokes
+        .iter()
+        .filter(|s| !s.closed && s.points[0].y == 2.125)
+        .collect();
+    assert_eq!(hatch_at_hole.len(), 2);
+    assert!(hatch_at_hole.iter().all(|s| {
+        !s.points
+            .windows(2)
+            .any(|p| p[0].x.min(p[1].x) < 2.0 && p[0].x.max(p[1].x) > 2.0)
+    }));
 }
