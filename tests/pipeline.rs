@@ -262,12 +262,14 @@ fn cli_project_roundtrip_matches_visible_gui_layer_route() {
         layers: vec![
             ProjectLayer {
                 raster: None,
+                text: None,
                 name: "visible".into(),
                 visible: true,
                 strokes: vec![rect(0., 0., 5., 5., 1)],
             },
             ProjectLayer {
                 raster: None,
+                text: None,
                 name: "hidden".into(),
                 visible: false,
                 strokes: vec![rect(-200., 0., 0., 50., 1)],
@@ -380,4 +382,126 @@ fn raster_cutoff_does_not_restore_hatch_inside_a_removed_hole() {
             .windows(2)
             .any(|p| p[0].x.min(p[1].x) < 2.0 && p[0].x.max(p[1].x) > 2.0)
     }));
+}
+
+#[test]
+fn portable_text_project_loads_and_cli_outputs_without_a_font() {
+    use penplot::{Project, ProjectLayer, TextLayer, text_outline};
+    let temp = tempfile::tempdir().unwrap();
+    let font_path = temp.path().join("only-here.ttf");
+    std::fs::write(&font_path, include_bytes!("fixtures/font/synthetic.ttf")).unwrap();
+    let face = text_outline::list_font_faces(&font_path).unwrap().remove(0);
+    let (art, font) =
+        text_outline::outline_text_with_identity(&face, "fi 日本語\nO", 10., 0.025).unwrap();
+    let mut project = Project {
+        layers: vec![ProjectLayer {
+            name: "Text: fi 日本語".into(),
+            visible: true,
+            strokes: art.strokes,
+            raster: None,
+            text: Some(TextLayer {
+                content: "fi 日本語\nO".into(),
+                font,
+                em_mm: 10.,
+                tolerance_mm: 0.025,
+                transform: [1., 0., 0., 1., 0., 0.],
+            }),
+        }],
+        options: JobOptions {
+            x: 10.,
+            y: 10.,
+            ..Default::default()
+        },
+        profile: Profile::default(),
+        import_options: ImportOptions::default(),
+    };
+    let json = project.to_json().unwrap();
+    assert!(!std::str::from_utf8(&json).unwrap().contains("only-here"));
+    std::fs::remove_file(font_path).unwrap();
+    let saved = temp.path().join("text.penplot");
+    std::fs::write(&saved, &json).unwrap();
+    let loaded = Project::from_json(&json).unwrap();
+    assert_eq!(loaded, project);
+    let result = Command::new(env!("CARGO_BIN_EXE_penplot"))
+        .current_dir(temp.path())
+        .args([
+            "convert",
+            "--calibrated",
+            "-o",
+            "text.gcode",
+            "text.penplot",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut strokes = vec![];
+    penplot::append_layer(&mut strokes, &loaded.layers[0].strokes, 0).unwrap();
+    let expected = generate(&plan(&strokes, &loaded.options).unwrap(), &loaded.profile).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("text.gcode")).unwrap(),
+        expected.gcode
+    );
+    project.layers[0].text = None;
+    let mut legacy = serde_json::to_value(
+        serde_json::from_slice::<serde_json::Value>(&project.to_json().unwrap()).unwrap(),
+    )
+    .unwrap();
+    legacy["version"] = 1.into();
+    legacy["layers"][0].as_object_mut().unwrap().remove("text");
+    assert!(
+        Project::from_json(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap()
+            .layers[0]
+            .text
+            .is_none()
+    );
+}
+
+#[test]
+fn malformed_text_metadata_is_rejected_without_loading_fonts() {
+    use penplot::{Project, ProjectLayer, TextLayer, text_outline};
+    let face = text_outline::list_font_faces(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/font/synthetic.ttf"),
+    )
+    .unwrap()
+    .remove(0);
+    let (art, font) = text_outline::outline_text_with_identity(&face, "O", 10., 0.025).unwrap();
+    let original = Project {
+        layers: vec![ProjectLayer {
+            name: "Text: O".into(),
+            visible: true,
+            strokes: art.strokes,
+            raster: None,
+            text: Some(TextLayer {
+                content: "O".into(),
+                font,
+                em_mm: 10.,
+                tolerance_mm: 0.025,
+                transform: [1., 0., 0., 1., 0., 0.],
+            }),
+        }],
+        options: JobOptions::default(),
+        profile: Profile::default(),
+        import_options: ImportOptions::default(),
+    };
+    for mutation in 0..8 {
+        let mut project = original.clone();
+        let text = project.layers[0].text.as_mut().unwrap();
+        match mutation {
+            0 => text.content = "O".repeat(2001),
+            1 => text.content = "O\n".repeat(101),
+            2 => text.font.sha256 = "bad".into(),
+            3 => text.transform[0] = 0.,
+            4 => text.em_mm = f64::NAN,
+            5 => text.transform[2] = 1.,
+            6 => text.content = "\u{0007}".into(),
+            _ => project.layers[0].strokes.clear(),
+        }
+        assert!(project.to_json().is_err(), "mutation {mutation}");
+    }
 }

@@ -15,6 +15,8 @@ use std::time::Duration;
 
 mod export_preview;
 use export_preview::{ExportInspection, format_duration};
+mod text_ui;
+use text_ui::TextDialog;
 mod object_edit;
 use object_edit::{ObjectContext, Selection};
 
@@ -49,6 +51,7 @@ struct Layer {
     strokes: Arc<[Stroke]>,
     visible: bool,
     raster: Option<penplot::RasterSettings>,
+    text: Option<penplot::TextLayer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +128,7 @@ struct Studio {
     layers: Vec<Layer>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    text_dialog: Option<TextDialog>,
     selected: Option<Selection>,
     route_targets: Vec<Option<Selection>>,
     object_context: Option<ObjectContext>,
@@ -176,6 +180,7 @@ impl Default for Studio {
             undo: Vec::new(),
             redo: Vec::new(),
             selected: None,
+            text_dialog: None,
             route_targets: Vec::new(),
             object_context: None,
             import_options: ImportOptions::default(),
@@ -303,7 +308,11 @@ impl Studio {
             self.add_raster_layer(item, settings);
         }
         self.confirm_project_actions(ctx);
-        self.object_shortcuts(ctx);
+        let text_was_open = self.text_dialog.is_some();
+        self.show_text_dialog(ctx);
+        if !text_was_open {
+            self.object_shortcuts(ctx);
+        }
         if self.preview_dirty && self.plan_task.is_none() {
             ctx.request_repaint();
         }
@@ -313,11 +322,12 @@ impl Studio {
 impl Studio {
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(5.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading(RichText::new("PENPLOT").strong().color(ACCENT));
             ui.label(RichText::new("STUDIO  /  RUST").small().weak());
             ui.separator();
-            let busy = self.import_task.is_some()
+            let busy = self.text_dialog.is_some()
+                || self.import_task.is_some()
                 || self.import_dialog.is_some()
                 || self.raster_import.is_busy();
             if ui
@@ -325,6 +335,15 @@ impl Studio {
                 .clicked()
             {
                 self.select_files(ctx);
+            }
+            if ui
+                .add_enabled(
+                    !busy && self.placement_drag.is_none(),
+                    egui::Button::new("Text…"),
+                )
+                .clicked()
+            {
+                self.open_text_dialog(None);
             }
             ui.add_enabled_ui(!busy, |ui| {
                 ui.menu_button("Project", |ui| {
@@ -390,7 +409,7 @@ impl Studio {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.raster_import.is_busy() {
+        if self.raster_import.is_busy() || self.text_dialog.is_some() {
             return;
         }
         let (open, save, shift) = ctx.input(|i| {
@@ -436,6 +455,9 @@ impl Studio {
     }
 
     fn begin_import(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if self.text_dialog.is_some() {
+            return;
+        }
         if paths.is_empty() {
             return;
         }
@@ -520,6 +542,7 @@ impl Studio {
             strokes: item.artwork.strokes.into(),
             visible: true,
             raster: Some(raster),
+            text: None,
         });
         self.selected = Some(Selection::Layer(self.layers.len() - 1));
         self.status = "Image layer imported. Check placement before export.".into();
@@ -547,6 +570,7 @@ impl Studio {
                             strokes: imported.artwork.strokes.into(),
                             visible: true,
                             raster: None,
+                            text: None,
                         });
                     }
                     self.selected = Some(Selection::Layer(self.layers.len() - 1));
@@ -790,6 +814,7 @@ impl Studio {
                     visible: layer.visible,
                     strokes: layer.strokes.to_vec(),
                     raster: layer.raster.clone(),
+                    text: layer.text.clone(),
                 })
                 .collect(),
             options: self.options.clone(),
@@ -810,6 +835,7 @@ impl Studio {
                     visible: layer.visible,
                     strokes: layer.strokes.into(),
                     raster,
+                    text: layer.text,
                 }
             })
             .collect();
@@ -825,6 +851,7 @@ impl Studio {
         self.undo.clear();
         self.redo.clear();
         self.selected = None;
+        self.text_dialog = None;
         self.placement_drag = None;
         self.air_first = true;
         self.inspector = Inspector::Artwork;
@@ -2322,6 +2349,7 @@ impl Studio {
             strokes: strokes.into(),
             visible: true,
             raster: None,
+            text: None,
         });
         self.selected = Some(Selection::Mark {
             layer: self.layers.len() - 1,
@@ -2684,6 +2712,7 @@ mod tests {
             name: "Hidden".into(),
             strokes: vec![hidden_stroke].into(),
             raster: None,
+            text: None,
             visible: false,
         });
         app.invalidate();

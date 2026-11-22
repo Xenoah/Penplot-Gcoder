@@ -43,7 +43,9 @@ pub(super) struct ObjectContext {
 }
 
 fn is_mark_layer(layer: &Layer) -> bool {
-    layer.name == "Canvas marks"
+    layer.text.is_none()
+        && layer.raster.is_none()
+        && layer.name == "Canvas marks"
         && !layer.strokes.is_empty()
         && layer.strokes.iter().all(|s| s.layer == "Canvas marks")
 }
@@ -188,7 +190,8 @@ impl Studio {
     }
 
     fn object_edits_blocked(&self, ctx: &egui::Context) -> bool {
-        self.raster_import.is_busy()
+        self.text_dialog.is_some()
+            || self.raster_import.is_busy()
             || self.placement_drag.is_some()
             || self.import_task.is_some()
             || self.import_dialog.is_some()
@@ -273,9 +276,15 @@ impl Studio {
             }
         }
         let mut delete = None;
+        let mut edit_text = None;
         response.context_menu(|ui| {
             if let Some(target) = self.context_delete_target() {
                 ui.label(&self.layers[target.layer()].name);
+                if self.layers[target.layer()].text.is_some() && ui.button("Edit text…").clicked()
+                {
+                    edit_text = Some(target.layer());
+                    ui.close();
+                }
                 if ui.button(target.delete_label()).clicked() {
                     delete = Some(target);
                     ui.close();
@@ -288,6 +297,9 @@ impl Studio {
                 ui.label("No object here. Select a drawn line or a layer.");
             }
         });
+        if let Some(index) = edit_text {
+            self.open_text_dialog(Some(index));
+        }
         if let Some(target) = delete {
             self.delete_object(target);
         }
@@ -303,6 +315,7 @@ impl Studio {
         let mut delete = None;
         let mut selected = self.selected;
         let mut context = self.object_context;
+        let mut edit_text = None;
         for (index, layer) in self.layers.iter().enumerate() {
             ui.add_enabled_ui(!blocked, |ui| {
                 ui.horizontal(|ui| {
@@ -334,6 +347,10 @@ impl Studio {
                             c.revision == self.revision && c.target == Some(target)
                         }) {
                             ui.label(&layer.name);
+                            if layer.text.is_some() && ui.button("Edit text…").clicked() {
+                                edit_text = Some(index);
+                                ui.close();
+                            }
                             if ui.button("Delete layer").clicked() {
                                 delete = Some(target);
                                 ui.close();
@@ -374,11 +391,17 @@ impl Studio {
                     {
                         action = Some((index, LayerAction::Move(index + 1)));
                     }
+                    if self.layers[index].text.is_some() && ui.button("Edit text…").clicked() {
+                        edit_text = Some(index);
+                    }
                     if ui.button(target.delete_label()).clicked() {
                         delete = Some(target);
                     }
                 })
             });
+        }
+        if let Some(index) = edit_text {
+            self.open_text_dialog(Some(index));
         }
         if let Some(target) = delete {
             self.delete_object(target);
@@ -634,12 +657,14 @@ mod tests {
                 strokes: vec![mark.clone()].into(),
                 visible: true,
                 raster: None,
+                text: None,
             },
             Layer {
                 name: "second.png".into(),
                 strokes: vec![mark].into(),
                 visible: true,
                 raster: None,
+                text: None,
             },
         ];
         app.selected = Some(Selection::Layer(0));
@@ -727,6 +752,7 @@ mod tests {
                 strokes: vec![rect.clone()].into(),
                 visible: false,
                 raster: None,
+                text: None,
             },
         );
         app.layers.push(Layer {
@@ -734,6 +760,7 @@ mod tests {
             strokes: vec![rect].into(),
             visible: true,
             raster: None,
+            text: None,
         });
         app.options.fill = Fill::Lines;
         app.options.hatch_angle = 0.;

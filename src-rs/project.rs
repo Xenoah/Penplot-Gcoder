@@ -1,5 +1,4 @@
-//! Versioned portable document format. Calibration acknowledgement is session
-//! state; opening a project never makes it eligible for machine export.
+//! Versioned portable document format; saved text outlines load without a font.
 use crate::{
     ImportOptions, JobOptions, MAX_FILE_BYTES, MAX_POINTS, MAX_STROKES, Profile, RasterSettings,
     Stroke, is_raster_filename,
@@ -7,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
-const SCHEMA: u32 = 2;
+const SCHEMA: u32 = 3;
 const MAX_LAYERS: usize = 128;
 const MAX_NAME: usize = 512;
 const MAX_COORD: f64 = 1e8;
@@ -27,6 +26,8 @@ pub struct ProjectLayer {
         alias = "raster_options"
     )]
     pub raster: Option<RasterSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::TextLayer>,
 }
 
 impl ProjectLayer {
@@ -114,7 +115,11 @@ impl Project {
         serde_json::to_writer(
             &mut buffer,
             &SaveProject {
-                version: SCHEMA,
+                version: if self.layers.iter().any(|layer| layer.text.is_some()) {
+                    SCHEMA
+                } else {
+                    2
+                },
                 layers: &self.layers,
                 options: &self.options,
                 profile: &self.profile,
@@ -158,6 +163,14 @@ impl Project {
             }
             if let Some(settings) = &layer.raster {
                 settings.validate()?;
+            }
+            if let Some(text) = &layer.text {
+                text.validate()?;
+                if layer.raster.is_some() || layer.strokes.is_empty() {
+                    return Err(
+                        "A text layer requires saved outlines and cannot also be an image.".into(),
+                    );
+                }
             }
             paths += layer.strokes.len();
             if paths > MAX_STROKES {
@@ -236,6 +249,7 @@ mod tests {
         project.import_options.invert = true;
         project.layers.push(ProjectLayer {
             raster: None,
+            text: None,
             name: "図形".to_owned(),
             visible: false,
             strokes: vec![Stroke {
@@ -286,6 +300,7 @@ mod tests {
         project.options = JobOptions::default();
         project.layers.push(ProjectLayer {
             raster: None,
+            text: None,
             name: "ok".to_owned(),
             visible: true,
             strokes: vec![Stroke {
@@ -316,6 +331,7 @@ mod tests {
         project.layers = vec![
             ProjectLayer {
                 raster: None,
+                text: None,
                 name: "ok".to_owned(),
                 visible: true,
                 strokes: vec![],

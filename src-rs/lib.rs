@@ -8,11 +8,14 @@ mod import_raster;
 mod import_vector;
 mod machine;
 mod project;
+mod text_layer;
+pub mod text_outline;
 pub use geometry::{
     Fill, JobOptions, PlanResult, RasterLayers, RasterSettings, fit, plan, plan_with_raster,
 };
 pub use machine::{Origin, Output, Profile, generate, generate_air_run};
 pub use project::{Project, ProjectLayer};
+pub use text_layer::TextLayer;
 
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_POINTS: usize = 500_000;
