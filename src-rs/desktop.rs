@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+mod export_preview;
+use export_preview::{ExportInspection, format_duration};
 mod raster_ui;
 use raster_ui::RasterImport;
 
@@ -134,7 +136,7 @@ struct Studio {
     status: String,
     error: Option<String>,
     planned: Vec<Stroke>,
-    output: Option<Output>,
+    output: Option<Arc<Output>>,
     placement_drag: Option<PlacementDrag>,
     placement_bounds_cache: Option<(u64, Option<[Point; 4]>)>,
     show_travel: bool,
@@ -153,7 +155,7 @@ struct Studio {
     allow_quit: bool,
     preview_dirty: bool,
     show_gcode: bool,
-    inspection_air: Option<Output>,
+    export_inspection: Option<ExportInspection>,
     air_first: bool,
     revision: u64,
     plan_task: Option<mpsc::Receiver<PlanReport>>,
@@ -201,7 +203,7 @@ impl Default for Studio {
             allow_quit: false,
             preview_dirty: true,
             show_gcode: false,
-            inspection_air: None,
+            export_inspection: None,
             air_first: true,
             revision: 0,
             plan_task: None,
@@ -365,28 +367,13 @@ impl Studio {
                 {
                     self.save_gcode(self.air_first);
                 }
-                if ui
-                    .checkbox(&mut self.air_first, "Air run first")
-                    .on_hover_text("Air run follows the same XY route but never lowers the pen.")
-                    .changed()
-                {
-                    self.show_gcode = false;
-                    self.inspection_air = None;
-                }
+                ui.checkbox(&mut self.air_first, "Air run first")
+                    .on_hover_text("Air run follows the same XY route but never lowers the pen.");
                 if ui
                     .add_enabled(enabled, egui::Button::new("Inspect G-code"))
                     .clicked()
                 {
-                    if self.air_first {
-                        match penplot::generate_air_run(&self.planned, &self.profile) {
-                            Ok(output) => self.inspection_air = Some(output),
-                            Err(error) => {
-                                self.status = error;
-                                return;
-                            }
-                        }
-                    }
-                    self.show_gcode = true;
+                    self.inspect_gcode(self.air_first);
                 }
             });
         });
@@ -650,8 +637,6 @@ impl Studio {
         self.project_dirty = true;
         self.revision = self.revision.wrapping_add(1);
         self.output = None;
-        self.inspection_air = None;
-        self.show_gcode = false;
         self.planned.clear();
         self.shown = 0;
         self.error = None;
@@ -691,9 +676,14 @@ impl Studio {
             ui.separator();
             if let Some(output) = &self.output {
                 ui.label(format!(
-                    "{:.1} mm draw   /   {:.1} mm travel   /   ~{:.0} s",
-                    output.draw_mm, output.travel_mm, output.seconds
-                )).on_hover_text("Motion estimate; actual firmware acceleration and starting position affect print time.");
+                    "{:.1} mm draw / {:.1} mm travel  ·  Est. plot ~{}  /  air ~{}",
+                    output.draw_mm,
+                    output.travel_mm,
+                    format_duration(output.seconds),
+                    format_duration(output.air_seconds),
+                )).on_hover_text(
+                    "Ideal motion + dwell only. Excludes acceleration, firmware overhead and the initial XY/Z moves.",
+                );
             } else if self.plan_task.is_some() {
                 ui.spinner();
                 ui.label(RichText::new("Planning current route…").weak());
@@ -716,6 +706,8 @@ impl Studio {
             ui.selectable_value(&mut self.inspector, Inspector::Machine, "Machine");
             ui.selectable_value(&mut self.inspector, Inspector::Route, "Route");
         });
+        ui.separator();
+        self.min_stroke_controls(ui);
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt(("inspector_scroll", self.inspector))
@@ -921,7 +913,6 @@ impl Studio {
         self.selected = None;
         self.placement_drag = None;
         self.air_first = true;
-        self.show_gcode = false;
         self.inspector = Inspector::Artwork;
         self.status = format!("Opened {}.", path.display());
         self.project_file = Some(path);
@@ -999,72 +990,52 @@ impl Studio {
         if !self.show_gcode {
             return;
         }
-        let can_copy = self.can_export();
-        egui::Window::new(if self.air_first {
-            "Air-run G-code"
+        let Some(inspection) = &mut self.export_inspection else {
+            return;
+        };
+        egui::Window::new(inspection.title())
+            .id(egui::Id::new("gcode_inspection"))
+            .open(&mut self.show_gcode)
+            .default_width(600.0)
+            .show(ctx, |ui| inspection.show(ui, self.revision));
+        if !self.show_gcode {
+            self.export_inspection = None;
+        }
+    }
+
+    fn export_commands(&self, air_run: bool) -> Result<Arc<Output>, String> {
+        if !self.can_export() {
+            return Err("No valid, current G-code route.".into());
+        }
+        if air_run {
+            penplot::generate_air_run(&self.planned, &self.profile).map(Arc::new)
         } else {
-            "Drawing G-code"
-        })
-        .open(&mut self.show_gcode)
-        .default_width(600.0)
-        .default_height(400.0)
-        .show(ctx, |ui| {
-            let result = if self.air_first {
-                &self.inspection_air
-            } else {
-                &self.output
-            };
-            let Some(result) = result else {
-                ui.label("The current route has no valid G-code.");
-                return;
-            };
-            if ui
-                .add_enabled(can_copy, egui::Button::new("Copy entire file"))
-                .clicked()
-            {
-                ui.ctx().copy_text(result.gcode.clone());
-            }
-            let mut end = result.gcode.len().min(48_000);
-            while !result.gcode.is_char_boundary(end) {
-                end -= 1;
-            }
-            let mut snippet = &result.gcode[..end];
-            if end != result.gcode.len() {
-                ui.small(
-                    "Preview limited to the first 48 KB. Copy and export preserve the full file.",
-                );
-            }
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut snippet)
-                        .code_editor()
-                        .desired_width(f32::INFINITY),
-                );
-            });
-        });
+            self.output
+                .clone()
+                .ok_or_else(|| "No valid, current G-code route.".into())
+        }
+    }
+
+    fn open_gcode_snapshot(&mut self, path: Option<PathBuf>, air_run: bool, output: Arc<Output>) {
+        let inspection = ExportInspection::new(path, self.revision, air_run, output, &self.profile);
+        self.export_inspection = Some(inspection);
+        self.show_gcode = true;
+    }
+
+    fn inspect_gcode(&mut self, air_run: bool) {
+        match self.export_commands(air_run) {
+            Ok(output) => self.open_gcode_snapshot(None, air_run, output),
+            Err(error) => self.status = error,
+        }
     }
 
     fn save_gcode(&mut self, air_run: bool) {
-        if !self.can_export() {
-            return;
-        }
-        let Some(output) = self.output.as_ref() else {
-            return;
-        };
-        let air;
-        let output = if air_run {
-            match penplot::generate_air_run(&self.planned, &self.profile) {
-                Ok(output) => {
-                    air = output;
-                    &air
-                }
-                Err(error) => {
-                    self.status = error;
-                    return;
-                }
+        let output = match self.export_commands(air_run) {
+            Ok(output) => output,
+            Err(error) => {
+                self.status = error;
+                return;
             }
-        } else {
-            output
         };
         let mut dialog = rfd::FileDialog::new()
             .add_filter("G-code", &["GCODE", "gcode"])
@@ -1099,6 +1070,7 @@ impl Studio {
                             path.display()
                         )
                     };
+                    self.open_gcode_snapshot(Some(path), air_run, output);
                 }
                 Err(error) => self.status = format!("Unable to save {}: {error}", path.display()),
             }
@@ -1395,28 +1367,50 @@ impl Studio {
         }
     }
 
-    fn route_panel(&mut self, ui: &mut egui::Ui) {
-        section(ui, "PATH PLANNING");
-        let mut draft = self.options.clone();
-        let mut changed = ui
-            .checkbox(&mut draft.optimize, "Reduce pen-up travel")
-            .changed();
-        ui.horizontal(|ui| {
-            ui.label("Min image stroke (mm)");
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut draft.min_image_stroke_mm)
-                        .range(0.0..=10_000.0)
-                        .speed(0.05),
-                )
-                .changed();
+    fn min_stroke_controls(&mut self, ui: &mut egui::Ui) {
+        let mut value = self.options.min_image_stroke_mm;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Min image stroke");
+            ui.add(
+                egui::DragValue::new(&mut value)
+                    .range(0.0..=10_000.0)
+                    .speed(0.1)
+                    .suffix(" mm")
+                    .max_decimals(3),
+            )
+            .on_hover_text(
+                "Click to type a minimum or drag in 0.1 mm steps. 0 keeps all image paths.",
+            );
+            if ui
+                .add_enabled(value > 0.0, egui::Button::new("Off"))
+                .on_hover_text("Keep all image paths (0 mm).")
+                .clicked()
+            {
+                value = 0.0;
+            }
         });
         if self.raster_removed.0 > 0 {
             ui.small(format!(
                 "Excluded {} image paths ({:.2} mm).",
                 self.raster_removed.0, self.raster_removed.1
             ));
+        } else {
+            ui.small("0 = off. Applies to image paths only.");
         }
+        if value != self.options.min_image_stroke_mm {
+            self.record_layers();
+            self.options.min_image_stroke_mm = value;
+            self.invalidate();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn route_panel(&mut self, ui: &mut egui::Ui) {
+        section(ui, "PATH PLANNING");
+        let mut draft = self.options.clone();
+        let mut changed = ui
+            .checkbox(&mut draft.optimize, "Reduce pen-up travel")
+            .changed();
         let label = match draft.fill {
             Fill::None => "Outlines only",
             Fill::Lines => "Hatch lines",
@@ -1508,7 +1502,7 @@ impl Studio {
                 self.planned = planned;
                 self.shown = self.planned.len();
                 match output {
-                    Ok(output) => self.output = Some(output),
+                    Ok(output) => self.output = Some(Arc::new(output)),
                     Err(error) => self.error = Some(error),
                 }
             }
@@ -2927,6 +2921,34 @@ mod tests {
         assert_eq!(app.frame.zoom, 1.0);
         assert_eq!(app.frame.shift, Vec2::ZERO);
         assert!(!app.show_travel);
+    }
+
+    #[test]
+    fn export_inspection_stays_on_the_saved_snapshot_after_edits() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(40.0, 30.0)], false)
+            .unwrap();
+        app.rebuild();
+        let path = PathBuf::from("PLOT.GCODE");
+        let output = app.export_commands(false).unwrap();
+        assert!(Arc::ptr_eq(&output, app.output.as_ref().unwrap()));
+        app.open_gcode_snapshot(Some(path.clone()), false, output);
+        let exported = app.revision;
+        app.options.x += 15.0;
+        app.invalidate();
+        assert!(app.export_commands(false).is_err());
+        let current = app.export_inspection.as_ref().unwrap();
+        assert_eq!(current.revision, exported);
+        assert_ne!(current.revision, app.revision);
+        assert_eq!(current.path.as_ref(), Some(&path));
+        assert_eq!(current.title(), "Exported plot G-code");
+        assert!(app.show_gcode);
+        app.rebuild();
+        app.inspect_gcode(true);
+        let inspection = app.export_inspection.unwrap();
+        assert_eq!(inspection.revision, app.revision);
+        assert!(inspection.path.is_none());
+        assert_eq!(inspection.title(), "Inspect air-run G-code");
     }
 
     #[test]

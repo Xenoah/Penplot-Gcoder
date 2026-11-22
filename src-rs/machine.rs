@@ -71,6 +71,7 @@ impl Profile {
     pub fn k9() -> Self {
         Self {
             name: "EasyThreed K9 (manual HOME; measure before use)".to_owned(),
+            travel_speed: 40.0,
             ..Self::default()
         }
     }
@@ -104,7 +105,11 @@ impl Profile {
             .and_then(Value::as_str)
             .unwrap_or("Legacy profile");
         let mut profile = if name.eq_ignore_ascii_case("k9") {
-            Self::k9()
+            Self {
+                // Keep old profile migration defaults; only the explicit Rust K9 preset is faster.
+                travel_speed: Self::default().travel_speed,
+                ..Self::k9()
+            }
         } else {
             Self {
                 name: name.to_owned(),
@@ -260,6 +265,8 @@ pub struct Output {
     /// Nominal movement and dwell only; excludes initial XY/Z, acceleration,
     /// firmware overhead, and any homing done manually before running.
     pub seconds: f64,
+    /// Nominal duration for the same XY commands without changing the Z height.
+    pub air_seconds: f64,
 }
 
 fn rounded(value: f64) -> f64 {
@@ -314,7 +321,9 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
         draw_mm: 0.0,
         travel_mm: 0.0,
         seconds: 0.0,
+        air_seconds: 0.0,
     };
+    let mut lift_seconds = 0.0;
     result
         .gcode
         .push_str("; Penplot-Gcoder / manual HOME before run\nG21\nG90\n");
@@ -364,17 +373,17 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
             writeln!(result.gcode, "G4 P{}", profile.liftup_delay).expect("writing to String");
         }
         z_line(&mut result.gcode, up, profile.pen_up_speed);
-        result.seconds += f64::from(profile.touchdown_delay + profile.liftup_delay) / 1000.0;
-        if !air_run {
-            result.seconds +=
-                (up - down) / profile.pen_up_speed + (up - down) / profile.pen_down_speed;
-        }
+        let dwell = f64::from(profile.touchdown_delay + profile.liftup_delay) / 1000.0;
+        result.air_seconds += dwell;
+        lift_seconds += (up - down) / profile.pen_up_speed + (up - down) / profile.pen_down_speed;
         current = points.last().copied();
     }
     if current.is_none() {
         return Err("No drawable strokes at command resolution".into());
     }
-    result.seconds += result.draw_mm / profile.draw_speed + result.travel_mm / profile.travel_speed;
+    result.air_seconds +=
+        result.draw_mm / profile.draw_speed + result.travel_mm / profile.travel_speed;
+    result.seconds = result.air_seconds + if air_run { 0.0 } else { lift_seconds };
     Ok(result)
 }
 
@@ -563,6 +572,42 @@ mod tests {
                 .contains("drawing area")
         );
         assert!(generate(&[], &profile).is_err());
+    }
+
+    #[test]
+    fn nominal_air_time_is_the_actual_air_run_time() {
+        let profile = Profile {
+            touchdown_delay: 100,
+            liftup_delay: 200,
+            ..Profile::default()
+        };
+        let strokes = [
+            stroke(&[(10.0, 10.0), (20.0, 10.0)], false),
+            stroke(&[(24.0, 10.0), (34.0, 10.0)], false),
+        ];
+        let plot = generate(&strokes, &profile).unwrap();
+        let air = generate_air_run(&strokes, &profile).unwrap();
+        assert!((plot.air_seconds - 2.8).abs() < 1e-8);
+        assert!((plot.seconds - 8.8).abs() < 1e-8);
+        assert_eq!(plot.air_seconds, air.seconds);
+        assert_eq!(air.air_seconds, air.seconds);
+    }
+
+    #[test]
+    fn only_the_explicit_rust_k9_preset_uses_forty_mm_per_second_for_travel() {
+        let default = Profile::default();
+        let k9 = Profile::k9();
+        assert_eq!(k9.travel_speed, 40.0);
+        assert_eq!(k9.draw_speed, default.draw_speed);
+        assert_eq!(k9.pen_up_speed, default.pen_up_speed);
+        assert_eq!(k9.pen_down_speed, default.pen_down_speed);
+        let (legacy, _) = Profile::from_json(include_str!("../profiles/printers/K9.json")).unwrap();
+        assert_eq!(legacy.travel_speed, default.travel_speed);
+        let (native, _) = Profile::from_json(&serde_json::to_string(&default).unwrap()).unwrap();
+        assert_eq!(native.travel_speed, default.travel_speed);
+        let output = generate(&[stroke(&[(10.0, 10.0), (20.0, 10.0)], false)], &k9).unwrap();
+        assert!(output.gcode.contains("G1 X10.000 Y10.000 F2400.000"));
+        assert!(output.gcode.contains("G1 X20.000 Y10.000 F600.000"));
     }
 
     #[test]
