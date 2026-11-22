@@ -34,3 +34,6 @@ profiles/user/
 *.tmp
 *.bak
 *.swp
+
+# Rust build artifacts
+/target/

@@ -13,6 +13,10 @@
 
 ---
 
+## Rust 版（2026-11-21）
+
+このブランチでは **Rust の GUI/CLI（src-rs/）が新しい作業対象**。以降の Python / PyQt6 の仕様は、旧版互換を評価するための記録であり新規出力の既定値ではない。Rust 版の実装範囲・未移植項目は [README](README.md)、実機校正と出力仕様は [K9 ガイド](docs/K9.md) を参照。G28/M84 等の旧テンプレートは引き継がない。
+
 ## プロジェクト概要
 
 3Dプリンターをペンプロッターとして使用するための、2Dベクター画像からGコードを生成するデスクトップアプリケーション。
@@ -422,6 +426,7 @@ opencv-python>=4.8.0
 | 仕様策定 | 塗りつぶし・オフセット・GCodeカスタマイズ追加 (v2) | 完了 |
 | 仕様策定 | タッチダウンディレイ・有効エリア連動・3Dプレビュー追加 (v3) | 完了 |
 | 仕様策定 | 3Dプレビューの実装ライブラリ選定 | 完了 (pyqtgraph) |
+| Rust 移行 | ネイティブ Studio・CLI・変換ライブラリ、SVG/DXF/画像入力、編集可能なプロジェクト、2D/等角リフト表示、配置・ハッチ・校正済みZリフト・空走・プロファイル移行 | 実装（実機未試験） |
 | 実装 | プロジェクト構成・雛形作成 | 完了 |
 | 実装 | GUIレイアウト (PyQt6) | 完了 |
 | 実装 | SVG読み込み・パス変換 | 完了 |
@@ -488,3 +493,4 @@ opencv-python>=4.8.0
 | 2026-03-07 | v11 | 配置コントロール (Scale/X/Y/R/中央/ドラッグ) を Raw タブ限定に変更 (Preview・3D タブでは無効化)。Raw 画像モードに mm 単位ベッド境界・有効エリアオーバーレイを追加 (設定変更でリアルタイム更新)。_source_groups+_source_files を _layers 構造 [{name,filepath,groups,visible}] に置き換え。PathListPanel をレイヤー対応に全面改修 (ファイル単位レイヤーヘッダー・表示/非表示チェックボックス・グループ並び替え)。 | ユーザー要件: Raw でのみ配置操作・ベッドサイズ表示・レイヤー管理 |
 | 2026-03-08 | v12 | Raw タブにツールバー (src/ui/raw_toolbar.py) を追加。描画ツール: フリーハンド(✏)・パス(📐)・直線・矩形・楕円、ストローク幅(mm)/色選択付き。Preview2D に全描画ツール対応の mouse イベント処理を追加 (path_drawn シグナル)。描画ストロークはアクティブな描画レイヤーへ追加。PathListPanel にアクティブレイヤー選択 (クリック)・リネーム (ダブルクリック)・追加 (+)/削除 (−) ボタンを追加。PenPath に stroke_width_mm フィールドを追加。 | ユーザー要件: Raw モードで直感的な描画・ペイントソフト風レイヤー管理 |
 | 2026-03-08 | v13 | GPT レビュー指摘に基づく大規模アーキテクチャ改善。DirtyLevel enum 多段化 (CLEAN/GCODE/PIPELINE/EXTRACT)。設定カテゴリ別スマート無効化 (_settings_hash による geo/gcode 区別)。Generate をバックグラウンドワーカー非同期化 (src/core/worker.py PipelineWorker QThread、job_id 競合防止、キャンセル機構、プログレスバー)。GCODE-only 変更はファストパスで同期実行。Undo 拡張 (AddPathCommand/AddLayerCommand/DeleteLayerCommand/ReorderGroupCommand)。バグ修正: add_layer DIRTY 欠落・overflow 判定 pipeline 後に一本化・closeEvent ワーカー安全停止。 | GPT アーキテクチャレビュー対応 |
+| 2026-11-21 | Rust 0.1 | Rust の GUI/CLI と共通経路エンジン・機械検証・旧設定の選択的移行・検査／ビルド手順を追加。旧 Python 版は存置。 | Python を使わずに描画データを編集・出力し、未確認の K9 固有設定を誤って再利用しないため。 |
