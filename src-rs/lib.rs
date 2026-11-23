@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
+mod centerline;
 mod geometry;
 mod import_raster;
 mod import_vector;
@@ -50,6 +51,21 @@ pub struct Artwork {
     pub strokes: Vec<Stroke>,
     pub warnings: Vec<String>,
 }
+/// Mutually exclusive ways to derive toolpaths from raster ink or shaped text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceMode {
+    #[default]
+    Outline,
+    Centerline,
+}
+
+impl TraceMode {
+    pub fn is_outline(&self) -> bool {
+        *self == Self::Outline
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportOptions {
@@ -57,6 +73,8 @@ pub struct ImportOptions {
     pub invert: bool,
     pub dpi: f64,
     pub tolerance: f64,
+    #[serde(default, skip_serializing_if = "TraceMode::is_outline")]
+    pub trace: TraceMode,
 }
 impl Default for ImportOptions {
     fn default() -> Self {
@@ -65,6 +83,7 @@ impl Default for ImportOptions {
             invert: false,
             dpi: 96.0,
             tolerance: 0.1,
+            trace: TraceMode::Outline,
         }
     }
 }

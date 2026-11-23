@@ -1,5 +1,5 @@
 //! Thin CLI: it never opens a serial port and shares the exact desktop pipeline.
-use penplot::{Fill, ImportOptions, JobOptions, Profile};
+use penplot::{Fill, ImportOptions, JobOptions, Profile, TraceMode};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -26,6 +26,7 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --dpi N              PNG/JPEG physical scale (default 96)
   --threshold 0..255   raster foreground brightness cutoff (default 128)
   --invert             select bright instead of dark pixels
+  --trace outline|centerline   trace raster contours (default) or single strokes
   --tolerance MM       vector curve flatness (default 0.1)
   --                   treat remaining arguments as input paths
 
@@ -171,6 +172,13 @@ fn run(mut it: Args) -> Result<(), String> {
                     .ok_or("--threshold must be an integer 0 to 255")?
             }
             "--invert" => import.invert = true,
+            "--trace" => {
+                import.trace = match value(&mut it, "--trace")?.to_str() {
+                    Some("outline") => TraceMode::Outline,
+                    Some("centerline") => TraceMode::Centerline,
+                    _ => return Err("--trace must be outline or centerline".into()),
+                }
+            }
             "--tolerance" => import.tolerance = num(&mut it, "--tolerance")?,
             flag if flag.starts_with('-') => return Err(format!("Unknown option {flag}")),
             _ => files.push(PathBuf::from(arg)),

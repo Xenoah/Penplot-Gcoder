@@ -424,13 +424,19 @@ impl Studio {
         {
             ui.separator();
             section(ui, "IMAGE LAYER FILL");
-            raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
+            if self.layers[index].strokes.iter().any(|s| s.filled) {
+                raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
+            } else {
+                ui.small("Centerline paths do not support hatching.");
+            }
             if self.layers[index].raster.as_ref() != Some(&settings) {
                 self.record_layers();
                 self.layers[index].raster = Some(settings);
                 self.invalidate();
             }
-            ui.small("Reimport the original image to change threshold, DPI, or inversion.");
+            ui.small(
+                "Reimport the original image to change trace mode, threshold, DPI, or inversion.",
+            );
         }
         ui.separator();
         self.placement_panel(ui);

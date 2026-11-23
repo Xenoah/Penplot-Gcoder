@@ -1,7 +1,7 @@
 //! Text editing is transactional: original outlines survive cancel, font loss and errors.
 use super::*;
-use penplot::TextLayer;
 use penplot::text_outline::{self, FontFace, FontIdentity};
+use penplot::{TextLayer, TraceMode};
 
 type OutlineResult = Result<(Artwork, FontIdentity), String>;
 struct Catalogue {
@@ -16,6 +16,7 @@ pub(super) struct TextDialog {
     content: String,
     em_mm: f64,
     tolerance_mm: f64,
+    trace: TraceMode,
     x: f64,
     y: f64,
     rotation_deg: f64,
@@ -45,6 +46,7 @@ impl TextDialog {
             content: metadata.map_or_else(String::new, |t| t.content.clone()),
             em_mm: metadata.map_or(10., |t| t.em_mm),
             tolerance_mm: metadata.map_or(0.025, |t| t.tolerance_mm),
+            trace: metadata.map_or(TraceMode::Outline, |t| t.trace),
             x: 10.,
             y: 10.,
             rotation_deg: 0.,
@@ -180,9 +182,10 @@ impl TextDialog {
         };
         let (sender, receiver) = mpsc::channel();
         let (text, em_mm, tolerance) = (self.content.clone(), self.em_mm, self.tolerance_mm);
+        let trace = self.trace;
         std::thread::spawn(move || {
-            let _ = sender.send(text_outline::outline_text_with_identity(
-                &font, &text, em_mm, tolerance,
+            let _ = sender.send(text_outline::trace_text_with_identity(
+                &font, &text, em_mm, tolerance, trace,
             ));
         });
         self.error = None;
@@ -256,7 +259,7 @@ impl TextDialog {
                 });
                 if old_chosen != self.chosen { self.replacement_confirmed = false; changed = true; }
                 if self.original_font.is_some() && self.chosen.is_none() && self.catalogue.is_none() {
-                    ui.colored_label(WARN, "The exact saved font is unavailable. Saved outlines are unchanged. Choose a replacement font and preview it before applying.");
+                    ui.colored_label(WARN, "The exact saved font is unavailable. Saved paths are unchanged. Choose a replacement font and preview it before applying.");
                 }
                 ui.horizontal(|ui| {
                     ui.label("Em size (mm)");
@@ -270,19 +273,23 @@ impl TextDialog {
                     changed |= ui.add(egui::DragValue::new(&mut self.y).range(-1e8..=1e8).speed(0.5)).changed();
                 });
                 ui.small("Size and position are in the current bed view. Em size is not the visible letter height. Existing rotation is preserved; later job scaling also scales text.");
+                changed |= raster_ui::trace_mode_controls(ui, &mut self.trace);
+                if self.trace == TraceMode::Centerline {
+                    ui.small("Centerlines are inferred from the font shape, not handwritten stroke order.");
+                }
                 if changed { self.invalidate(); }
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(self.chosen.is_some() && self.worker.is_none() && self.file_task.is_none() && self.catalogue.is_none(), egui::Button::new("Preview outlines")).clicked() { self.generate(); }
+                    if ui.add_enabled(self.chosen.is_some() && self.worker.is_none() && self.file_task.is_none() && self.catalogue.is_none(), egui::Button::new("Preview paths")).clicked() { self.generate(); }
                     if self.worker.is_some() || self.file_task.is_some() { ui.spinner(); }
                 });
                 if let Some(error) = &self.error { ui.colored_label(WARN, error); }
                 if let Some((_,artwork,identity)) = &self.preview {
-                    ui.label(format!("{} · {} · {} contours",identity.family, identity.style, artwork.strokes.len()));
+                    ui.label(format!("{} · {} · {} paths",identity.family, identity.style, artwork.strokes.len()));
                     outline_preview(ui, &artwork.strokes);
                     for warning in &artwork.warnings { ui.colored_label(WARN, warning); }
                 }
                 if self.replacement_needed() {
-                    ui.colored_label(WARN, "This font differs from the saved font. Review the new outlines.");
+                    ui.colored_label(WARN, "This font differs from the saved font. Review the new paths.");
                     ui.checkbox(&mut self.replacement_confirmed, "Use this replacement font for this text");
                 }
                 ui.small("TTF/OTF/TTC/OTC outlines; variable fonts use default axes. Missing or bitmap/color-only glyphs report an error. Font files stay on this PC and are never embedded.");
@@ -446,6 +453,7 @@ impl Studio {
             font: identity.clone(),
             em_mm: dialog.em_mm,
             tolerance_mm: dialog.tolerance_mm,
+            trace: dialog.trace,
             transform: compose(inverse(self.text_world_transform())?, physical),
         };
         metadata.validate()?;
@@ -592,6 +600,39 @@ mod tests {
         assert_eq!(app.layers[0].text.as_ref().unwrap().content, "O日本語");
         app.undo();
         assert_eq!(first, app.as_project().to_json().unwrap());
+    }
+
+    #[test]
+    fn centerline_text_reopens_in_the_same_trace_mode_and_plots_one_ring() {
+        let mut app = Studio::default();
+        let mut draft = prepare(&app, None, "O");
+        draft.trace = TraceMode::Centerline;
+        let (art, id) = text_outline::trace_text_with_identity(
+            &draft.faces[0],
+            "O",
+            draft.em_mm,
+            draft.tolerance_mm,
+            draft.trace,
+        )
+        .unwrap();
+        draft.preview = Some((draft.revision, art, id));
+        app.apply_text(&draft).unwrap();
+        app.rebuild();
+        assert_eq!(app.planned.len(), 1);
+        assert!(app.planned[0].closed && !app.planned[0].filled);
+        assert!(app.can_export());
+        let json = app.as_project().to_json().unwrap();
+        let project = Project::from_json(&json).unwrap();
+        let metadata = project.layers[0].text.as_ref().unwrap();
+        assert_eq!(metadata.trace, TraceMode::Centerline);
+        let reopened = TextDialog::from_metadata(
+            Some(0),
+            app.revision,
+            Some(metadata),
+            app.text_world_transform(),
+        );
+        assert_eq!(reopened.trace, TraceMode::Centerline);
+        assert_eq!(project.layers[0].strokes.len(), 1);
     }
 
     #[test]
@@ -790,6 +831,22 @@ mod tests {
             assert!(!art.strokes.is_empty());
             assert_eq!(id.sha256.len(), 64);
             assert!(art.strokes.iter().all(|s| s.closed && s.points.len() >= 2));
+            let (paths, same_id) = text_outline::trace_text_with_identity(
+                &font,
+                text,
+                10.,
+                0.025,
+                TraceMode::Centerline,
+            )
+            .unwrap();
+            assert_eq!(id, same_id);
+            assert!(paths.strokes.iter().any(|s| !s.closed));
+            assert!(
+                paths
+                    .strokes
+                    .iter()
+                    .all(|s| !s.filled && s.points.len() >= 2)
+            );
         }
     }
 }

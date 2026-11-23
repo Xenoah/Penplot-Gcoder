@@ -749,6 +749,108 @@ pub fn outline_text_with_identity(
     outline_from_bytes(&bytes, font.face_index, text, em_mm, tolerance_mm).map(|art| (art, id))
 }
 
+/// Trace the visible ink of each shaped outline glyph, including its white
+/// counters. These are inferred plotting paths, not the original pen order.
+fn centerline_text(mut art: Artwork, em_mm: f64) -> Result<Artwork, String> {
+    let step = em_mm / 144.0;
+    let mut paths = Vec::new();
+    let mut dropped = 0;
+    let mut vertices = 0;
+    let mut pixels = 12_000_000usize;
+    let mut scans = 30_000_000usize;
+    for rings in art.strokes.chunk_by(|a, b| a.group == b.group) {
+        let (x0, y0, x1, y1) = rings.iter().flat_map(|r| &r.points).fold(
+            (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(x0, y0, x1, y1), p| (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)),
+        );
+        let origin = Point::new(x0 - step, y0 - step);
+        let width = ((x1 - x0) / step).ceil() as usize + 2;
+        let height = ((y1 - y0) / step).ceil() as usize + 2;
+        if width > 2048 || height > 2048 {
+            return Err("A glyph is too large for centerline tracing. Use Outline.".into());
+        }
+        pixels = pixels.checked_sub(width * height).ok_or(
+            "Text is too long for centerline tracing. Split it into shorter text objects.",
+        )?;
+        let edges: Vec<_> = rings
+            .iter()
+            .flat_map(|s| s.points.windows(2).map(|w| (w[0], w[1])))
+            .filter(|(a, b)| a.y != b.y)
+            .collect();
+        scans = scans
+            .checked_sub(edges.len() * height)
+            .ok_or("Text is too detailed for centerline tracing. Split it or use Outline.")?;
+        let mut mask = vec![0u8; width * height];
+        let mut crossings = Vec::with_capacity(edges.len());
+        for (row, cells) in mask.chunks_exact_mut(width).enumerate() {
+            let y = origin.y + (height as f64 - row as f64 - 0.5) * step;
+            crossings.clear();
+            for &(a, b) in &edges {
+                if (a.y <= y && y < b.y) || (b.y <= y && y < a.y) {
+                    let x = a.x + (b.x - a.x) * (y - a.y) / (b.y - a.y);
+                    crossings.push((x, if b.y > a.y { 1 } else { -1 }));
+                }
+            }
+            crossings.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            let mut cross = crossings.iter().peekable();
+            let mut winding = 0;
+            for (column, pixel) in cells.iter_mut().enumerate() {
+                let x = origin.x + (column as f64 + 0.5) * step;
+                while cross.peek().is_some_and(|(edge_x, _)| *edge_x <= x) {
+                    winding += cross.next().expect("inspected crossing").1;
+                }
+                *pixel = u8::from(winding != 0);
+            }
+        }
+        let mut result =
+            crate::centerline::trace(&mask, width, height, step, origin, "Text centerlines")?;
+        if result.strokes.is_empty() {
+            dropped += 1;
+        }
+        for s in &mut result.strokes {
+            s.group = rings[0].group;
+            vertices += s.points.len();
+        }
+        paths.extend(result.strokes);
+        if paths.len() > MAX_STROKES || vertices > MAX_POINTS {
+            return Err("Text centerlines exceed the geometry limit.".into());
+        }
+    }
+    if paths.is_empty() {
+        return Err(
+            "Text has no drawable centerlines. Use Outline for tiny or isolated marks.".into(),
+        );
+    }
+    if dropped != 0 {
+        art.warnings.push(format!(
+            "{dropped} glyph(s) had no drawable centerline. Use Outline if the marks are required."
+        ));
+    }
+    art.strokes = paths;
+    crate::check_size(&art.strokes)?;
+    Ok(art)
+}
+
+/// Shape text and produce only the requested trace style, reading the font once.
+pub fn trace_text_with_identity(
+    font: &FontFace,
+    text: &str,
+    em_mm: f64,
+    tolerance_mm: f64,
+    trace: crate::TraceMode,
+) -> Result<(Artwork, FontIdentity), String> {
+    let (art, id) = outline_text_with_identity(font, text, em_mm, tolerance_mm)?;
+    match trace {
+        crate::TraceMode::Outline => Ok((art, id)),
+        crate::TraceMode::Centerline => centerline_text(art, em_mm).map(|art| (art, id)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +906,38 @@ mod tests {
         };
         assert_eq!(bounds(&art), (0.0, 0.0, 10.0, 14.0));
         assert_eq!(bounds(&outline("O", 10.0)), (0.0, 0.0, 5.0, 7.0));
+    }
+
+    #[test]
+    fn text_centerline_keeps_the_counter_as_one_ring() {
+        let art = centerline_text(outline("O", 10.), 10.).unwrap();
+        assert_eq!(art.strokes.len(), 1);
+        let stroke = &art.strokes[0];
+        assert!(stroke.closed && !stroke.filled);
+        assert!(stroke.points.len() >= 4);
+        assert!(
+            stroke
+                .points
+                .iter()
+                .all(|p| p.x > 0. && p.x < 5. && p.y > 0. && p.y < 7.)
+        );
+        assert_eq!(outline("O", 10.).strokes.len(), 2);
+    }
+
+    #[test]
+    fn centerline_text_keeps_shaped_unicode_multiline_glyphs_in_position() {
+        let art = centerline_text(outline("日本語\nO", 10.), 10.).unwrap();
+        let latin: Vec<_> = art.strokes.iter().filter(|s| s.group == 3).collect();
+        assert_eq!(latin.len(), 1);
+        assert!(latin[0].closed);
+        assert!(latin[0].points.iter().all(|p| p.y < 7.));
+        assert!((0..3).all(|group| art.strokes.iter().any(|s| s.group == group)));
+        assert!(
+            art.strokes
+                .iter()
+                .filter(|s| s.group != 3)
+                .all(|s| s.points.iter().all(|p| p.y > 7.))
+        );
     }
 
     #[test]

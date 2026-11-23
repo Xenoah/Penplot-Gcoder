@@ -7,7 +7,7 @@ SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリン�
 ## まず試す（実機なし）
 
 1. Windows x64 ビルドの `penplot-studio.exe` を起動。ソースからは下記 `cargo run`。同梱の `examples/alignment-card.svg` を画面にドロップする。
-2. 2D の **Move / Scale / Rotate** で表示中の全レイヤーをまとめて移動・拡縮・回転できる。拡縮は角、回転は丸いハンドルをドラッグ。Shift で移動を軸に固定・回転を 15° 刻みにし、Esc で操作を取り消せる。**Artwork** では値やレイヤー順を編集できる。**Route** で輪郭だけ／平行ハッチ／クロスハッチを比較する。実線が描画。ペン上げ移動の破線は タイムラインの Show travel で表示する（初期状態は非表示）。タイムラインでストローク順を追える。**3D lifts** は機械設定の上下 Z とストローク間のリフトを固定視点で立体表示し、Z は 1〜12 倍に誇張できる（[画面例](docs/studio-lifts.png)）。実機の干渉判定ではない。
+2. 2D の **Move / Scale** は同じモードで、枠内をドラッグして移動、角をドラッグして縦横比を保って拡大・縮小。表示中の全レイヤーに作用する。回転は **Rotate** の丸いハンドルをドラッグ。Shift で移動を軸に固定・回転を 15° 刻みにし、Esc で操作を取り消せる。**Artwork** では値やレイヤー順を編集できる。**Route** で輪郭だけ／平行ハッチ／クロスハッチを比較する。実線が描画。ペン上げ移動の破線は タイムラインの Show travel で表示する（初期状態は非表示）。タイムラインでストローク順を追える。**3D lifts** は機械設定の上下 Z とストローク間のリフトを固定視点で立体表示し、Z は 1〜12 倍に誇張できる（[画面例](docs/studio-lifts.png)）。実機の干渉判定ではない。
 3. 外枠は原寸 40 × 24 mm。**Fit** は余白を残して拡縮するので、原寸のまま使うなら Scale = 1。図形は回転→拡縮し、回転後外接枠の左下を紙面 X/Y に合わせる。
 4. ファイルを実機で使う段階で、**Machine** に接触・退避 Z、送り、実際の可動範囲と取付補正を入力する。先に **Export air run…** で全経路ペン上げの空走ファイルを出力する。[K9 の実測・手動 HOME・初回テスト](docs/K9.md)
 
@@ -32,27 +32,27 @@ Windows 出力は `target/release/penplot-studio.exe` と `penplot.exe`。Linux 
 |---|---|
 | SVG | viewBox・物理単位・グループ変換・ベジェ/円弧を展開。1 CSS px = 25.4/96 mm。独立したサブパスを結ばない。テキストはパスへ、画像・クリップ・マスク・フィルタ等は事前に輪郭化。省略の警告を確認する。|
 | ASCII DXF | モデル空間の LINE、ARC、CIRCLE、ELLIPSE、2D POLYLINE／LWPOLYLINE（bulge）、2D SPLINE（制御点・ノットを持つ 1〜8 次の多項式／有理曲線）。フィット点だけのスプラインは対象外。$INSUNITS を mm に換算し、未指定時は mm として警告。バイナリ DXF、INSERT、3D/メッシュは対象外。|
-| PNG / JPEG | DPI と輝度しきい値（反転可能）で黒領域の**外周・穴**を抽出。暗線の中心線ではなく、画素セルの境界を描く。透明部分は白、図の Y 軸を上向きに変換。画像の EXIF 回転・DPI メタデータは自動適用しない。|
+| PNG / JPEG | DPI と輝度しきい値（反転可能）で、既定の **Outline** は画素セルの外周と穴を、**Centerline** は暗線を細線化して中心の経路だけを抽出。透明部分は白、図の Y 軸を上向きに変換。画像の EXIF 回転・DPI メタデータは自動適用しない。|
 
 - ファイルごとのレイヤー表示・順序・削除、線／矩形／楕円／フリーハンド、Undo/Redo。複数ファイルは元座標で重ねて配置する。
 - **Project → Save / Open** で複数レイヤー、描き加えた図形、配置・描画条件と機械設定を単一の `.penplot` に保存する。元画像へのリンクではなく抽出後の形状を格納し、ファイルの再配置や別 PC でも再開できる。有効な計算済み経路があれば通常／空走を書き出せる。範囲外・空経路・計算中の古い経路は書き出さない。
-- 画像の取り込み画面では Threshold、Image DPI、反転、輪郭のみ／ハッチ／クロスハッチを画像ごとに指定。しきい値の計算が終わるまでは直前の輪郭を表示し、古いプレビューを確定しない。塗り方・間隔・角度は取り込み後もレイヤーごとに変更でき、しきい値・DPI・反転の変更には元画像を再度取り込む。
+- 画像の取り込み画面では Threshold、Image DPI、反転、輪郭のみ／ハッチ／クロスハッチを画像ごとに指定。しきい値やトレース方式の計算が終わるまでは直前の経路を表示し、古いプレビューを確定しない。塗り方・間隔・角度は取り込み後もレイヤーごとに変更でき、方式・しきい値・DPI・反転の変更には元画像を再度取り込む。**Centerline** では輪郭やハッチを重ねない。分岐では線をなぞり直さず必要に応じてペンを上げる。極小点・孤立点や太い面の意図した筆順は復元できない。CLI は `--trace centerline`（画像のみ）。
 - 左パネル上部の **Min image stroke** は最終配置後の画像経路だけを指定長未満で省く。数値をクリックして mm を入力でき、**Off** で 0（無効）に戻す。輪郭の途中は切らない。プレビュー・通常出力・空走に共通。CLI では `--min-image-stroke MM`。
 - ハッチは閉じた塗り領域に限定し、同一グループの穴を偶奇則で除く。近い線を勝手につながない。最適化は同じレイヤーの連続区間で並び替え・開線の逆転を試みる。
 - 入力は 16 MiB まで（ベクターは 8 MiB）、画像は 8 MP、ドキュメント全体は 50 万頂点・10 万経路まで。さらに曲線／ハッチ密度による処理上限あり。形状が重すぎる場合は簡略化するかハッチの間隔を広げる。
 - **紙面と機械の両方で範囲を検証**。問題があれば保存をブロックする。出力は mm・絶対座標、送り F は mm/min。発熱・押出・自動 HOME・モーター解放は行わない。
 
-## 文字を追加・編集する（v0.3.0）
+## 文字を追加・編集する
 
-**Text…** を開き、本文、Family（書体ファミリ）、Face（コレクション内のフェイス）、Em size（mm）を選び、**Preview outlines → Add text** で独立した文字レイヤーを追加する。本文は日本語・英数混在を含む横書きの複数行に対応する。Anchor X/Y は紙面上の位置。Em size は字面の実測高さではなくフォントの em サイズで、ジョブの拡縮は追加済みの文字にも作用する。
+**Text…** を開き、本文、Family（書体ファミリ）、Face（コレクション内のフェイス）、Em size（mm）と **Trace（Outline / Centerline）** を選び、**Preview paths → Add text** で独立した文字レイヤーを追加する。本文は日本語・英数混在を含む横書きの複数行に対応する。Anchor X/Y は紙面上の位置。Em size は字面の実測高さではなくフォントの em サイズで、ジョブの拡縮は追加済みの文字にも作用する。
 
-追加後はレイヤー選択後の **Edit text…**、または文字上／レイヤー行の右クリックから再編集できる。変更はプレビュー後の **Apply text** まで確定されず、キャンセル・生成エラーは元の形状を保持する。削除と Undo/Redo は文字レイヤー単位。文字の穴も閉輪郭として描画する。現版の文字出力は輪郭で、文字の自動塗りつぶし・中心線化は行わない。
+追加後はレイヤー選択後の **Edit text…**、または文字上／レイヤー行の右クリックから再編集できる。変更はプレビュー後の **Apply text** まで確定されず、キャンセル・生成エラーは元の形状を保持する。削除と Undo/Redo は文字レイヤー単位。Outline は文字の穴も閉輪郭として描画する。Centerline は同じフォントの字形から推定する一本線で、輪郭・塗りつぶしを重ねない。O のような形では通常ひとつのループになる。細い部分やセリフに短い枝が出ることがあるのでプレビューで確認する。フォントに筆順データが加わるわけではない。
 
 - Windows のマシン全体とユーザー別にインストールされたフォントをオフラインで列挙する。**Font file…** から手元の TTF / OTF / TTC / OTC も指定できる。ファイルは 64 MiB、コレクションは 256 フェイスまで。非インストールのフォントは再編集時に同じファイルを選び直す場合がある。
 - OpenType のシェーピング、結合文字、対応するリガチャ、双方向のスクリプト処理を行う。必要な文字がない場合はコードポイントを含むエラーを表示する。自動フォールバックで別フォントに変えることはない。
 - 可変フォントは既定軸。軸の調整、縦書き、任意の named instance 選択は現版では未対応。ビットマップ専用や描画用の輪郭を持たないカラーグリフは使えない。すべてのフォント／字形を描ける保証ではない。
-- `.penplot` には本文・フォントの識別子・保存済み輪郭を記録し、フォント本体やローカルパスは含めない。フォントがない別 PC でも保存済みの絵と G-code を再現できる。再編集時は元と同じバイト／フェイスを照合し、違うフォントでは新しい輪郭をプレビューして **Use this replacement font** を選ぶまで適用できない。
-- 本文は 2,000 Unicode 文字／100 行。プロジェクト全体の 16 MiB・50 万頂点・10 万経路の制限も適用する。文字を含む保存ファイルは形式 v3、文字なしは v2。既存の v1/v2 プロジェクトを開ける。v0.3.0 の文字を含むプロジェクトを古いアプリで開くことはできない。
+- `.penplot` には本文・フォントの識別子・保存済み経路を記録し、フォント本体やローカルパスは含めない。フォントがない別 PC でも保存済みの絵と G-code を再現できる。再編集時は元と同じバイト／フェイスを照合し、違うフォントでは新しい経路をプレビューして **Use this replacement font** を選ぶまで適用できない。
+- 本文は 2,000 Unicode 文字／100 行。プロジェクト全体の 16 MiB・50 万頂点・10 万経路の制限も適用する。文字を含む保存ファイルは形式 v3、文字なしは v2。既存の v1/v2 プロジェクトを開ける。旧形式の輪郭設定を継承する。中心線の文字メタデータを含む保存ファイルは v0.4.0 以降で開く。
 
 Linux の実フォントとヘッドレス egui の Unicode／IME イベントで検証している。ネイティブ Windows のフォント列挙・実際の IME 操作と K9 実機動作は未検証。
 
@@ -102,4 +102,4 @@ Rust の入口は `src-rs/lib.rs`（変換）、`src-rs/desktop.rs`（GUI）、`
 
 ### Selecting and deleting objects
 
-Click a line in Pan, Move, Scale or Rotate to select its object, or select a row in the Layers list. Imported SVG/DXF/images are selected as whole layers; a canvas mark is selected as one continuous stroke. A layer row always targets that whole layer. Delete or the scoped right-click menu removes the selected object, and Ctrl+Z restores it (Ctrl+Y / Ctrl+Shift+Z redo). Right-clicking blank canvas clears the selection. Text/number editing, dialogs, import work and active drags keep their own keys. Deleting an object preserves the placement of the remaining artwork and invalidates generated output until replanning finishes.
+Click a line in Pan, Move / Scale or Rotate to select its object, or select a row in the Layers list. Imported SVG/DXF/images are selected as whole layers; a canvas mark is selected as one continuous stroke. A layer row always targets that whole layer. Delete or the scoped right-click menu removes the selected object, and Ctrl+Z restores it (Ctrl+Y / Ctrl+Shift+Z redo). Right-clicking blank canvas clears the selection. Text/number editing, dialogs, import work and active drags keep their own keys. Deleting an object preserves the placement of the remaining artwork and invalidates generated output until replanning finishes.

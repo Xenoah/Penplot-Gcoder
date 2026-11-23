@@ -1,5 +1,6 @@
 //! Image import keeps the prior successful outline while a newer threshold is traced.
 use super::*;
+use penplot::TraceMode;
 
 pub(super) const DEBOUNCE: Duration = Duration::from_millis(140);
 
@@ -157,25 +158,31 @@ impl RasterImport {
                 );
             });
             ui.checkbox(&mut draft.options.invert, "Trace light instead of dark");
+            trace_mode_controls(ui, &mut draft.options.trace);
             if draft.options != before {
                 draft.invalidate();
             }
             ui.separator();
-            raster_fill_controls(ui, &mut draft.fill, "raster_import_fill");
+            if draft.options.trace.is_outline() {
+                raster_fill_controls(ui, &mut draft.fill, "raster_import_fill");
+            } else {
+                ui.small("Centerline paths are single strokes and are not hatched. Isolated dots may be omitted.");
+            }
             ui.separator();
             draft.poll(ctx);
-            ui.strong("Preview outlines");
+            ui.strong("Preview paths");
             if !draft.is_current() {
-                ui.label("Updating… showing last valid outlines when available.");
+                ui.label("Updating… showing last valid paths when available.");
             } else if let Some(error) = &draft.error {
                 ui.colored_label(WARN, error);
                 if draft.preview.is_some() {
-                    ui.small("Showing previous outlines; the current settings cannot be imported.");
+                    ui.small("Showing previous paths; the current settings cannot be imported.");
                 }
             } else if let Some(preview) = &draft.preview {
                 ui.small(format!(
-                    "{} outline paths. Fill is calculated after placement.",
-                    preview.artwork.strokes.len()
+                    "{} paths.{}",
+                    preview.artwork.strokes.len(),
+                    if draft.options.trace.is_outline() { " Fill is calculated after placement." } else { "" }
                 ));
             }
             preview_outlines(ui, draft.preview.as_ref());
@@ -189,6 +196,9 @@ impl RasterImport {
         if add {
             let mut draft = self.draft.take().expect("add requires image draft");
             ctx.request_repaint();
+            if !draft.options.trace.is_outline() {
+                draft.fill.fill = Fill::None;
+            }
             return draft.preview.take().map(|item| (item, draft.fill));
         }
         if cancel || modal.should_close() {
@@ -197,6 +207,16 @@ impl RasterImport {
         }
         None
     }
+}
+
+pub(super) fn trace_mode_controls(ui: &mut egui::Ui, trace: &mut TraceMode) -> bool {
+    let before = *trace;
+    ui.horizontal(|ui| {
+        ui.label("Trace");
+        ui.selectable_value(trace, TraceMode::Outline, "Outline");
+        ui.selectable_value(trace, TraceMode::Centerline, "Centerline");
+    });
+    *trace != before
 }
 
 pub(super) fn raster_fill_controls(
@@ -296,6 +316,7 @@ mod tests {
         let mut draft = Draft::new("a.png".into(), ImportOptions::default());
         draft.accept(0, Ok(demo("first")));
         assert!(draft.can_add());
+        draft.options.trace = TraceMode::Centerline;
         draft.invalidate();
         assert_eq!(draft.preview.as_ref().unwrap().name, "first");
         assert!(!draft.can_add());

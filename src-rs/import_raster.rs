@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 use image::{ImageFormat, ImageReader, Limits};
 
-use crate::{Artwork, ImportOptions, Point, Stroke};
+use crate::{Artwork, ImportOptions, Point, Stroke, TraceMode, centerline};
 
 const MAX_INPUT: usize = 32 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 8192;
@@ -60,7 +60,25 @@ pub fn raster(bytes: &[u8], options: &ImportOptions) -> Result<Artwork, String> 
         })
         .collect::<Vec<_>>();
     drop(rgba);
-    trace(&mut mask, width, height, 25.4 / options.dpi)
+    let mm = 25.4 / options.dpi;
+    match options.trace {
+        TraceMode::Outline => trace(&mut mask, width, height, mm),
+        TraceMode::Centerline => {
+            let art = centerline::trace(
+                &mask,
+                width as usize,
+                height as usize,
+                mm,
+                Point::default(),
+                "Raster centerlines",
+            )?;
+            if art.strokes.is_empty() {
+                Err("No drawable centerline. Adjust the threshold or use Outline for isolated dots.".into())
+            } else {
+                Ok(art)
+            }
+        }
+    }
 }
 
 fn trace(mask: &mut [u8], width: u32, height: u32, mm: f64) -> Result<Artwork, String> {
@@ -188,6 +206,7 @@ mod tests {
             invert: false,
             dpi: 25.4,
             tolerance: 0.1,
+            trace: TraceMode::Outline,
         }
     }
 
@@ -272,6 +291,26 @@ mod tests {
                 .all(|p| p.x >= 1.0 && p.x <= 2.0)
         );
         assert_eq!(area(&out.strokes[0].points), -0.5);
+    }
+
+    #[test]
+    fn centerline_png_uses_threshold_dpi_and_never_adds_contours() {
+        let mut px = vec![0; 8 * 3 * 4];
+        px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+        let bytes = png(8, 3, &px);
+        let mut opts = options();
+        let outline = raster(&bytes, &opts).unwrap();
+        assert!(outline.strokes[0].filled);
+        opts.trace = TraceMode::Centerline;
+        let art = raster(&bytes, &opts).unwrap();
+        assert_eq!(art.strokes.len(), 1);
+        assert!(!art.strokes[0].filled && !art.strokes[0].closed);
+        let left = art.strokes[0].points[0];
+        assert_eq!(left.y, 1.5);
+        opts.dpi *= 2.;
+        assert_eq!(raster(&bytes, &opts).unwrap().strokes[0].points[0].y, 0.75);
+        opts.invert = true;
+        assert!(raster(&bytes, &opts).is_err());
     }
 
     #[test]

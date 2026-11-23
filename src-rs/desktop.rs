@@ -57,8 +57,7 @@ struct Layer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Pan,
-    Move,
-    Scale,
+    Transform,
     Rotate,
     Line,
     Rectangle,
@@ -70,8 +69,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Pan => "Pan",
-            Self::Move => "Move",
-            Self::Scale => "Scale",
+            Self::Transform => "Move / Scale",
             Self::Rotate => "Rotate",
             Self::Line => "Line",
             Self::Rectangle => "Box",
@@ -81,13 +79,12 @@ impl Tool {
     }
 
     fn placement(self) -> bool {
-        matches!(self, Self::Move | Self::Scale | Self::Rotate)
+        matches!(self, Self::Transform | Self::Rotate)
     }
 
     fn label_localized(self, japanese: bool) -> &'static str {
         match (self, japanese) {
-            (Self::Move, true) => "移動",
-            (Self::Scale, true) => "拡大縮小",
+            (Self::Transform, true) => "移動・拡大縮小",
             (Self::Rotate, true) => "回転",
             _ => self.label(),
         }
@@ -1668,6 +1665,11 @@ fn rotate_handle(points: [Pos2; 4]) -> Pos2 {
     }
 }
 
+fn scale_handle_radius(corners: [Pos2; 4]) -> f32 {
+    // Keep the body draggable even when all four handles are close together.
+    (corners[0].distance(corners[2]) * 0.28).min(11.0)
+}
+
 fn draw_placement_handles(painter: &egui::Painter, map: CanvasMap, bounds: [Point; 4], tool: Tool) {
     let points = bounds.map(|point| map.screen(point));
     let color = Color32::from_rgb(30, 125, 111);
@@ -1676,9 +1678,10 @@ fn draw_placement_handles(painter: &egui::Painter, map: CanvasMap, bounds: [Poin
         Ink::new(1.4, color),
     ));
     match tool {
-        Tool::Scale => {
+        Tool::Transform => {
+            let size = (1.2 * scale_handle_radius(points)).clamp(2.0, 9.0);
             for point in points {
-                painter.rect_filled(Rect::from_center_size(point, Vec2::splat(9.0)), 2.0, color);
+                painter.rect_filled(Rect::from_center_size(point, Vec2::splat(size)), 2.0, color);
             }
         }
         Tool::Rotate => {
@@ -1690,6 +1693,37 @@ fn draw_placement_handles(painter: &egui::Painter, map: CanvasMap, bounds: [Poin
             painter.circle_filled(handle, 5.0, color);
         }
         _ => {}
+    }
+}
+
+fn placement_handle(
+    tool: Tool,
+    press: Pos2,
+    corners: [Pos2; 4],
+    bounds: [Point; 4],
+) -> Option<PlacementHandle> {
+    let near = |point: Pos2| press.distance(point) <= 11.0;
+    match tool {
+        Tool::Transform => corners
+            .iter()
+            .enumerate()
+            .filter(|(i, corner)| {
+                press.distance(**corner) <= scale_handle_radius(corners)
+                    && corner.distance(corners[(*i + 2) % 4]) > 0.2
+            })
+            .min_by(|(_, a), (_, b)| press.distance(**a).total_cmp(&press.distance(**b)))
+            .map(|(i, _)| PlacementHandle::Scale(bounds[(i + 2) % 4]))
+            .or_else(|| {
+                Rect::from_two_pos(corners[0], corners[2])
+                    .expand(9.0)
+                    .contains(press)
+                    .then_some(PlacementHandle::Move)
+            }),
+        Tool::Rotate if near(rotate_handle(corners)) => Some(PlacementHandle::Rotate(Point::new(
+            (bounds[0].x + bounds[2].x) * 0.5,
+            (bounds[0].y + bounds[2].y) * 0.5,
+        ))),
+        _ => None,
     }
 }
 
@@ -1733,33 +1767,7 @@ impl Studio {
             && let Some(press) = ui.input(|input| input.pointer.press_origin())
             && let Some(bounds) = self.placement_bounds()
         {
-            let corners = bounds.map(|point| map.screen(point));
-            let near = |point: Pos2| press.distance(point) <= 11.0;
-            let handle = match self.tools {
-                Tool::Move
-                    if Rect::from_two_pos(corners[0], corners[2])
-                        .expand(9.0)
-                        .contains(press) =>
-                {
-                    Some(PlacementHandle::Move)
-                }
-                Tool::Scale => corners
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, corner)| near(**corner))
-                    .min_by(|(_, a), (_, b)| press.distance(**a).total_cmp(&press.distance(**b)))
-                    .and_then(|(i, _)| {
-                        (corners[i].distance(corners[(i + 2) % 4]) > 0.2)
-                            .then_some(PlacementHandle::Scale(bounds[(i + 2) % 4]))
-                    }),
-                Tool::Rotate if near(rotate_handle(corners)) => {
-                    Some(PlacementHandle::Rotate(Point::new(
-                        (bounds[0].x + bounds[2].x) * 0.5,
-                        (bounds[0].y + bounds[2].y) * 0.5,
-                    )))
-                }
-                _ => None,
-            };
+            let handle = placement_handle(self.tools, press, bounds.map(|p| map.screen(p)), bounds);
             if let Some(handle) = handle {
                 self.play = false;
                 self.shown = self.planned.len();
@@ -1810,8 +1818,7 @@ impl Studio {
             }
             for tool in [
                 Tool::Pan,
-                Tool::Move,
-                Tool::Scale,
+                Tool::Transform,
                 Tool::Rotate,
                 Tool::Line,
                 Tool::Rectangle,
@@ -1847,8 +1854,12 @@ impl Studio {
                 ui.ctx().request_repaint();
             }
             let hint = match self.tools {
-                Tool::Move => "Drag the frame or artwork · Shift: one axis · Esc: cancel",
-                Tool::Scale => "Drag a corner · Esc: cancel",
+                Tool::Transform if self.japanese => {
+                    "内側をドラッグで移動 · 角で拡大縮小 · Shiftで軸固定 · Escで取消"
+                }
+                Tool::Transform => {
+                    "Drag inside to move · corners resize · Shift: one axis · Esc: cancel"
+                }
                 Tool::Rotate => "Drag the circular handle · Shift: 15° steps · Esc: cancel",
                 _ => "Wheel: zoom · Middle drag: pan",
             };
@@ -2531,7 +2542,7 @@ fn draft_geometry(tool: Tool, points: &[Point]) -> Option<(Vec<Point>, bool)> {
     let dx = last.x - first.x;
     let dy = last.y - first.y;
     let line = match tool {
-        Tool::Pan | Tool::Move | Tool::Scale | Tool::Rotate => return None,
+        Tool::Pan | Tool::Transform | Tool::Rotate => return None,
         Tool::Freehand if points.len() >= 2 => {
             let distinct = points
                 .iter()
@@ -2741,6 +2752,32 @@ mod tests {
     }
 
     #[test]
+    fn transform_prioritizes_resize_handles_and_moves_from_inside() {
+        let bounds = [
+            Point::new(10., 20.),
+            Point::new(60., 20.),
+            Point::new(60., 70.),
+            Point::new(10., 70.),
+        ];
+        let corners = bounds.map(|p| Pos2::new(p.x as f32, p.y as f32));
+        assert!(matches!(
+            placement_handle(Tool::Transform, Pos2::new(14., 23.), corners, bounds),
+            Some(PlacementHandle::Scale(p)) if p == bounds[2]
+        ));
+        assert!(matches!(
+            placement_handle(Tool::Transform, Pos2::new(35., 40.), corners, bounds),
+            Some(PlacementHandle::Move)
+        ));
+        assert!(placement_handle(Tool::Transform, Pos2::new(0., 0.), corners, bounds).is_none());
+        assert!(placement_handle(Tool::Pan, Pos2::new(35., 40.), corners, bounds).is_none());
+        let tiny = corners.map(|p| Pos2::new(p.x * 0.1, p.y * 0.1));
+        assert!(matches!(
+            placement_handle(Tool::Transform, tiny[0].lerp(tiny[2], 0.5), tiny, bounds),
+            Some(PlacementHandle::Move)
+        ));
+    }
+
+    #[test]
     fn placement_scale_fixes_opposite_corner_and_keeps_positive_scale() {
         let pivot = Point::new(20.0, 20.0);
         let mut drag = PlacementDrag {
@@ -2818,7 +2855,7 @@ mod tests {
         app.add_mark(vec![Point::new(30.0, 30.0), Point::new(65.0, 60.0)], false)
             .unwrap();
         app.rebuild();
-        app.tools = Tool::Move;
+        app.tools = Tool::Transform;
         let history = app.undo.len();
         let draw = |app: &mut Studio, events| {
             ctx.run(

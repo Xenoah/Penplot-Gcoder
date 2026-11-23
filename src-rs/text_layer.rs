@@ -12,6 +12,8 @@ pub struct TextLayer {
     pub font: FontIdentity,
     pub em_mm: f64,
     pub tolerance_mm: f64,
+    #[serde(default, skip_serializing_if = "crate::TraceMode::is_outline")]
+    pub trace: crate::TraceMode,
     /// [a,b,c,d,x,y]: maps normalized text mm into the document's source coordinates.
     pub transform: [f64; 6],
 }
