@@ -316,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn mixed_import_waits_for_vectors_before_starting_the_image_draft() {
+        let mut app = Studio::default();
+        let (_sender, receiver) = mpsc::channel::<ImportReport>();
+        app.import_task = Some(receiver);
+        app.raster_import.extend([PathBuf::from("queued.png")]);
+        app.switch_workspace(Workspace::Import);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        assert!(app.raster_import.draft.is_none());
+        assert_eq!(app.raster_import.queue.len(), 1);
+        assert!(app.layers.is_empty());
+    }
+
+    #[test]
     fn import_workspace_round_trip_retains_draft_and_cancel_allows_reimport() {
         let mut app = Studio::default();
         let mut draft = Draft::new("demo.png".into(), ImportOptions::default());

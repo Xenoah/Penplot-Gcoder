@@ -128,7 +128,10 @@ impl Studio {
             }
             match self.workspace {
                 Workspace::Import if self.raster_import.is_busy() => {
-                    if let Some((item, settings)) =
+                    if self.import_task.is_some() {
+                        ui.spinner();
+                        ui.label("Reading vector files… image settings will follow.");
+                    } else if let Some((item, settings)) =
                         self.raster_import.show(ui, &self.import_options)
                     {
                         self.add_raster_layer(item, settings);
