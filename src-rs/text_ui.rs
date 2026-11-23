@@ -525,7 +525,7 @@ impl Studio {
             }
         }
         self.selected = Some(Selection::Layer(index));
-        self.inspector = Inspector::Artwork;
+        self.switch_workspace(Workspace::Edit);
         self.invalidate();
         self.status = "Text outlines saved. Select the layer and Edit text… to change it.".into();
         Ok(())

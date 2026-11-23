@@ -209,7 +209,7 @@ impl Studio {
             || ctx.input(|i| i.pointer.any_down())
             || egui::Popup::is_any_open(ctx)
             || self.help_open
-            || self.show_gcode
+            || self.workspace == Workspace::Preview
         {
             return;
         }
@@ -327,10 +327,15 @@ impl Studio {
                     {
                         action = Some((index, LayerAction::Visibility(visible)));
                     }
-                    let response = ui.selectable_label(
-                        selected.is_some_and(|s| s.layer() == index),
-                        format!("{}  ·  {}", layer.name, layer.strokes.len()),
-                    );
+                    let response = ui
+                        .add(
+                            egui::Button::selectable(
+                                selected.is_some_and(|s| s.layer() == index),
+                                &layer.name,
+                            )
+                            .wrap(),
+                        )
+                        .on_hover_text(format!("{} paths", layer.strokes.len()));
                     let target = Selection::Layer(index);
                     if response.clicked() {
                         selected = Some(target);
@@ -375,7 +380,7 @@ impl Studio {
                 Selection::Mark { .. } => "Selected: one canvas mark",
             });
             ui.add_enabled_ui(!blocked, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(index > 0, egui::Button::new("Move up"))
                         .clicked()
@@ -437,17 +442,6 @@ impl Studio {
             ui.small(
                 "Reimport the original image to change trace mode, threshold, DPI, or inversion.",
             );
-        }
-        ui.separator();
-        self.placement_panel(ui);
-        ui.separator();
-        self.import_panel(ui);
-        if !self.notices.is_empty() {
-            ui.separator();
-            section(ui, "IMPORT NOTES");
-            for notice in &self.notices {
-                ui.colored_label(WARN, notice);
-            }
         }
     }
 }
@@ -690,7 +684,7 @@ mod tests {
             )
         };
         let output = panel(&mut app, vec![]);
-        let pos = button_center(&output, "second.png  ·  1").unwrap();
+        let pos = button_center(&output, "second.png").unwrap();
         panel(&mut app, vec![egui::Event::PointerMoved(pos)]);
         for pressed in [true, false] {
             panel(

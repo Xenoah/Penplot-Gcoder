@@ -20,6 +20,9 @@ use text_ui::TextDialog;
 mod object_edit;
 use object_edit::{ObjectContext, Selection};
 
+mod workspace;
+use workspace::Workspace;
+
 mod raster_ui;
 use raster_ui::RasterImport;
 
@@ -91,13 +94,6 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum Inspector {
-    Artwork,
-    Machine,
-    Route,
-}
-
 #[derive(Clone)]
 struct Snapshot {
     layers: Vec<Layer>,
@@ -122,6 +118,8 @@ struct PlanReport {
 }
 
 struct Studio {
+    #[cfg(test)]
+    canvas_rect: Rect,
     layers: Vec<Layer>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -132,7 +130,8 @@ struct Studio {
     import_options: ImportOptions,
     profile: Profile,
     options: JobOptions,
-    inspector: Inspector,
+    workspace: Workspace,
+    pending_export: Option<bool>,
     tools: Tool,
     frame: Camera,
     isometric: bool,
@@ -173,6 +172,8 @@ struct Studio {
 impl Default for Studio {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            canvas_rect: Rect::NOTHING,
             layers: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -183,7 +184,8 @@ impl Default for Studio {
             import_options: ImportOptions::default(),
             profile: Profile::default(),
             options: JobOptions::default(),
-            inspector: Inspector::Artwork,
+            workspace: Workspace::Edit,
+            pending_export: None,
             tools: Tool::Pan,
             frame: Camera::default(),
             isometric: false,
@@ -227,7 +229,7 @@ pub fn run() -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 780.0])
-            .with_min_inner_size([900.0, 560.0])
+            .with_min_inner_size([760.0, 560.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -288,22 +290,11 @@ impl Studio {
         }
         self.poll_plan(ctx);
         self.step_player(ctx);
+        self.finish_pending_export();
         egui::TopBottomPanel::top("header").show(ctx, |ui| self.header(ui, ctx));
         egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| self.timeline(ui));
-        egui::SidePanel::left("inspector")
-            .default_width(294.0)
-            .width_range(245.0..=370.0)
-            .show(ctx, |ui| self.inspector(ui));
-        egui::CentralPanel::default().show(ctx, |ui| self.canvas(ui));
-        self.gcode_window(ctx);
+        self.workspace_ui(ctx);
         self.help_window(ctx);
-        if self.import_task.is_none()
-            && !self.confirm_quit
-            && self.pending_open.is_none()
-            && let Some((item, settings)) = self.raster_import.show(ctx, &self.import_options)
-        {
-            self.add_raster_layer(item, settings);
-        }
         self.confirm_project_actions(ctx);
         let text_was_open = self.text_dialog.is_some();
         self.show_text_dialog(ctx);
@@ -378,30 +369,32 @@ impl Studio {
             {
                 self.help_open = true;
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = self.can_export();
-                let title = if self.air_first {
-                    "Export air run…"
-                } else {
-                    "Export G-code…"
-                };
-                if ui
-                    .add_enabled(enabled, egui::Button::new(title))
-                    .on_disabled_hover_text("Wait for a valid, current route before exporting.")
-                    .clicked()
-                {
-                    self.save_gcode(self.air_first);
-                }
-                ui.checkbox(&mut self.air_first, "Air run first")
-                    .on_hover_text("Air run follows the same XY route but never lowers the pen.");
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Inspect G-code"))
-                    .clicked()
-                {
-                    self.inspect_gcode(self.air_first);
-                }
-            });
         });
+        ui.horizontal_wrapped(|ui| {
+            let enabled = self.can_export();
+            let title = if self.air_first {
+                "Export air run…"
+            } else {
+                "Export G-code…"
+            };
+            if ui
+                .button(title)
+                .on_hover_text("Export the current document from any workspace.")
+                .clicked()
+            {
+                self.request_export(self.air_first);
+            }
+            ui.checkbox(&mut self.air_first, "Air run first")
+                .on_hover_text("Air run follows the same XY route but never lowers the pen.");
+            if ui
+                .add_enabled(enabled, egui::Button::new("Inspect G-code"))
+                .clicked()
+            {
+                self.inspect_gcode(self.air_first);
+            }
+        });
+        ui.separator();
+        self.workspace_tabs(ui);
         ui.add_space(5.0);
     }
 
@@ -458,6 +451,7 @@ impl Studio {
         if paths.is_empty() {
             return;
         }
+        self.switch_workspace(Workspace::Import);
         if self.import_task.is_some() || self.raster_import.is_busy() {
             self.status = "An import is already in progress; try again when it finishes.".into();
             return;
@@ -529,7 +523,6 @@ impl Studio {
         {
             self.notices
                 .push(format!("{}: workspace geometry limit reached.", item.name));
-            self.inspector = Inspector::Artwork;
             return;
         }
         self.record_layers();
@@ -543,7 +536,6 @@ impl Studio {
         });
         self.selected = Some(Selection::Layer(self.layers.len() - 1));
         self.status = "Image layer imported. Check placement before export.".into();
-        self.inspector = Inspector::Artwork;
         self.invalidate();
     }
 
@@ -554,8 +546,7 @@ impl Studio {
                     self.import_task = None;
                     self.notices.extend(result.notices);
                     if result.items.is_empty() {
-                        self.status = "No artwork imported. See the notes in Artwork.".into();
-                        self.inspector = Inspector::Artwork;
+                        self.status = "No artwork imported. See the notes in Import.".into();
                         return;
                     }
                     self.record_layers();
@@ -573,7 +564,6 @@ impl Studio {
                     self.selected = Some(Selection::Layer(self.layers.len() - 1));
                     self.status =
                         format!("{count} layer(s) imported. Check placement before export.");
-                    self.inspector = Inspector::Artwork;
                     self.invalidate();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -684,7 +674,7 @@ impl Studio {
 
     fn timeline(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let count = self.planned.len();
             if ui.add_enabled(count != 0, egui::Button::new(if self.play { "Pause" } else { "Play" })).clicked() {
                 if self.shown >= count {
@@ -720,26 +710,6 @@ impl Studio {
             ui.label(RichText::new(&self.status).weak());
         }
         ui.add_space(4.0);
-    }
-
-    fn inspector(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.inspector, Inspector::Artwork, "Artwork");
-            ui.selectable_value(&mut self.inspector, Inspector::Machine, "Machine");
-            ui.selectable_value(&mut self.inspector, Inspector::Route, "Route");
-        });
-        ui.separator();
-        self.min_stroke_controls(ui);
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt(("inspector_scroll", self.inspector))
-            .auto_shrink([false, false])
-            .show(ui, |ui| match self.inspector {
-                Inspector::Artwork => self.artwork_panel(ui),
-                Inspector::Machine => self.machine_panel(ui),
-                Inspector::Route => self.route_panel(ui),
-            });
     }
 
     fn open_project_dialog(&mut self) {
@@ -793,6 +763,7 @@ impl Studio {
                 Ok(()) => {
                     self.project_dirty = false;
                     let status = format!("Saved project to {}.", path.display());
+                    self.pending_export = None;
                     self.project_file = Some(path);
                     status
                 }
@@ -851,8 +822,8 @@ impl Studio {
         self.text_dialog = None;
         self.placement_drag = None;
         self.air_first = true;
-        self.inspector = Inspector::Artwork;
         self.status = format!("Opened {}.", path.display());
+        self.pending_export = None;
         self.project_file = Some(path);
         self.invalidate();
         self.project_dirty = false;
@@ -924,26 +895,9 @@ impl Studio {
             });
     }
 
-    fn gcode_window(&mut self, ctx: &egui::Context) {
-        if !self.show_gcode {
-            return;
-        }
-        let Some(inspection) = &mut self.export_inspection else {
-            return;
-        };
-        egui::Window::new(inspection.title())
-            .id(egui::Id::new("gcode_inspection"))
-            .open(&mut self.show_gcode)
-            .default_width(600.0)
-            .show(ctx, |ui| inspection.show(ui, self.revision));
-        if !self.show_gcode {
-            self.export_inspection = None;
-        }
-    }
-
     fn export_commands(&self, air_run: bool) -> Result<Arc<Output>, String> {
         if !self.can_export() {
-            return Err("No valid, current G-code route.".into());
+            return Err(self.export_unavailable_reason());
         }
         if air_run {
             penplot::generate_air_run(&self.planned, &self.profile).map(Arc::new)
@@ -958,6 +912,7 @@ impl Studio {
         let inspection = ExportInspection::new(path, self.revision, air_run, output, &self.profile);
         self.export_inspection = Some(inspection);
         self.show_gcode = true;
+        self.switch_workspace(Workspace::Preview);
     }
 
     fn inspect_gcode(&mut self, air_run: bool) {
@@ -1189,7 +1144,7 @@ impl Studio {
     fn machine_panel(&mut self, ui: &mut egui::Ui) {
         section(ui, "MACHINE PROFILE");
         ui.label(RichText::new(&self.profile.name).strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Load JSON…").clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Profile", &["json"])
@@ -1211,11 +1166,14 @@ impl Studio {
         });
         ui.add_space(4.0);
         let profile = &mut self.profile;
-        let mut changed = ui.text_edit_singleline(&mut profile.name).changed();
+        let mut changed = ui
+            .add(egui::TextEdit::singleline(&mut profile.name).desired_width(ui.available_width()))
+            .changed();
         changed |= number(ui, "Bed X (mm)", &mut profile.bed_x, 0.5);
         changed |= number(ui, "Bed Y (mm)", &mut profile.bed_y, 0.5);
         changed |= number(ui, "Maximum Z (mm)", &mut profile.max_z, 0.1);
         egui::ComboBox::from_id_salt("origin")
+            .width(ui.available_width().min(200.0))
             .selected_text(match profile.origin {
                 Origin::LeftBottom => "Front left",
                 Origin::Center => "Center",
@@ -1239,13 +1197,13 @@ impl Studio {
         changed |= number(ui, "Pen down (mm/s)", &mut profile.pen_down_speed, 0.1);
         changed |= number(ui, "Draw (mm/s)", &mut profile.draw_speed, 0.5);
         changed |= number(ui, "Travel (mm/s)", &mut profile.travel_speed, 0.5);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("After pen down (ms)");
             changed |= ui
                 .add(egui::DragValue::new(&mut profile.touchdown_delay).speed(5))
                 .changed();
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Before pen up (ms)");
             changed |= ui
                 .add(egui::DragValue::new(&mut profile.liftup_delay).speed(5))
@@ -1354,6 +1312,7 @@ impl Studio {
             Fill::Cross => "Cross-hatch",
         };
         egui::ComboBox::from_id_salt("fill")
+            .width(ui.available_width().min(200.0))
             .selected_text(label)
             .show_ui(ui, |ui| {
                 changed |= ui
@@ -1392,6 +1351,8 @@ impl Studio {
             && self.import_dialog.is_none()
             && self.import_task.is_none()
             && !self.raster_import.is_busy()
+            && self.text_dialog.is_none()
+            && self.error.is_none()
     }
 
     fn poll_plan(&mut self, ctx: &egui::Context) {
@@ -1433,6 +1394,7 @@ impl Studio {
 
     fn update_preview(&mut self, report: PlanReport) {
         self.error = None;
+        self.output = None;
         self.raster_removed = report.removed;
         match report.result {
             Ok((planned, output)) => {
@@ -1491,6 +1453,12 @@ fn calculate_plan(revision: u64, snapshot: &Snapshot, profile: &Profile) -> Plan
 }
 
 fn number(ui: &mut egui::Ui, label: &str, field: &mut f64, speed: f64) -> bool {
+    if ui.available_width() < 210.0 {
+        ui.label(label);
+        return ui
+            .add(egui::DragValue::new(field).speed(speed).max_decimals(4))
+            .changed();
+    }
     ui.horizontal(|ui| {
         ui.label(label);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1816,25 +1784,6 @@ impl Studio {
                 ui.label(RichText::new("Drawing simulation · not collision checked").weak());
                 return;
             }
-            for tool in [
-                Tool::Pan,
-                Tool::Transform,
-                Tool::Rotate,
-                Tool::Line,
-                Tool::Rectangle,
-                Tool::Ellipse,
-                Tool::Freehand,
-            ] {
-                if ui
-                    .selectable_label(self.tools == tool, tool.label_localized(self.japanese))
-                    .clicked()
-                {
-                    self.tools = tool;
-                    self.draft.clear();
-                    self.placement_drag = None;
-                }
-            }
-            ui.separator();
             if ui.button("Reset view").clicked() {
                 self.frame = Camera::default();
             }
@@ -2604,10 +2553,11 @@ mod tests {
             .unwrap();
         app.rebuild();
         assert!(app.output.is_some());
-        for inspector in [Inspector::Artwork, Inspector::Machine, Inspector::Route] {
-            app.inspector = inspector;
+        for workspace in [Workspace::Edit, Workspace::Import, Workspace::Preview] {
+            app.switch_workspace(workspace);
             draw_frame(&mut app);
         }
+        app.switch_workspace(Workspace::Edit);
         app.isometric = true;
         draw_frame(&mut app);
     }

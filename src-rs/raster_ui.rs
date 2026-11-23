@@ -124,13 +124,18 @@ impl RasterImport {
         self.draft.is_some() || !self.queue.is_empty()
     }
 
+    fn cancel_current(&mut self) {
+        self.draft = None;
+    }
+
     /// Includes the queued-before-first-frame case: avoid acting on another
     /// layer or opening a second document before the modal becomes visible.
     pub(super) fn show(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         defaults: &ImportOptions,
     ) -> Option<(Imported, penplot::RasterSettings)> {
+        let ctx = ui.ctx().clone();
         if self.draft.is_none() {
             self.draft = self
                 .queue
@@ -140,8 +145,7 @@ impl RasterImport {
         let draft = self.draft.as_mut()?;
         let mut add = false;
         let mut cancel = false;
-        let modal = egui::Modal::new(egui::Id::new("raster_import")).show(ctx, |ui| {
-            ui.set_min_width(420.0);
+        egui::ScrollArea::vertical().id_salt("raster_import").show(ui, |ui| {
             ui.heading("Import image");
             ui.label(draft.path.file_name().unwrap_or_default().to_string_lossy());
             let before = draft.options.clone();
@@ -169,7 +173,7 @@ impl RasterImport {
                 ui.small("Centerline paths are single strokes and are not hatched. Isolated dots may be omitted.");
             }
             ui.separator();
-            draft.poll(ctx);
+            draft.poll(&ctx);
             ui.strong("Preview paths");
             if !draft.is_current() {
                 ui.label("Updating… showing last valid paths when available.");
@@ -201,8 +205,8 @@ impl RasterImport {
             }
             return draft.preview.take().map(|item| (item, draft.fill));
         }
-        if cancel || modal.should_close() {
-            self.draft = None;
+        if cancel {
+            self.cancel_current();
             ctx.request_repaint();
         }
         None
@@ -258,7 +262,7 @@ pub(super) fn raster_fill_controls(
 
 fn preview_outlines(ui: &mut egui::Ui, preview: Option<&Imported>) {
     let (rect, painter) = ui.allocate_painter(
-        Vec2::new(ui.available_width().clamp(300.0, 580.0), 210.0),
+        Vec2::new(ui.available_width().clamp(100.0, 680.0), 210.0),
         Sense::hover(),
     );
     let rect = rect.rect;
@@ -309,6 +313,41 @@ mod tests {
             name: name.into(),
             artwork: Artwork::default(),
         }
+    }
+
+    #[test]
+    fn import_workspace_round_trip_retains_draft_and_cancel_allows_reimport() {
+        let mut app = Studio::default();
+        let mut draft = Draft::new("demo.png".into(), ImportOptions::default());
+        draft.options.threshold = 64;
+        draft.options.trace = TraceMode::Centerline;
+        draft.fill.hatch_spacing = 2.5;
+        draft.accept(0, Ok(demo("retained")));
+        app.raster_import.draft = Some(draft);
+        for workspace in [
+            Workspace::Import,
+            Workspace::Edit,
+            Workspace::Preview,
+            Workspace::Import,
+        ] {
+            app.switch_workspace(workspace);
+            let draft = app.raster_import.draft.as_ref().unwrap();
+            assert_eq!(draft.options.threshold, 64);
+            assert_eq!(draft.options.trace, TraceMode::Centerline);
+            assert_eq!(draft.fill.hatch_spacing, 2.5);
+            assert_eq!(draft.preview.as_ref().unwrap().name, "retained");
+            assert!(draft.can_add());
+            assert!(!app.can_export());
+        }
+        app.raster_import.cancel_current();
+        assert!(!app.raster_import.is_busy());
+        app.raster_import.extend([PathBuf::from("second.png")]);
+        assert!(app.raster_import.is_busy());
+        assert_eq!(
+            app.raster_import.queue.front().unwrap(),
+            &PathBuf::from("second.png")
+        );
+        assert!(app.layers.is_empty());
     }
 
     #[test]
