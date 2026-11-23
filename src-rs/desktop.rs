@@ -763,7 +763,6 @@ impl Studio {
                 Ok(()) => {
                     self.project_dirty = false;
                     let status = format!("Saved project to {}.", path.display());
-                    self.pending_export = None;
                     self.project_file = Some(path);
                     status
                 }
