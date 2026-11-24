@@ -38,6 +38,9 @@ No machine access, homing, extrusion, heating or motor disable commands.
 P1S is layout-only. Aries output is experimental and requires measured Z values.
 In profile JSON, pen_down_z (Draw Z) and pen_up_z (Clearance Z) are separate
 absolute heights in mm from the same active/homed Z origin; offset_z adds to both.
+The K9 profile pre-fills k9_start_gcode.code; set k9_start_gcode.enabled to
+true only to test the experimental M203 X/Y, M201 X/Y and M204 P/T preamble.
+This does not change commanded feeds or save EEPROM, and affects air runs too.
 "#;
 type Args = std::vec::IntoIter<OsString>;
 fn value(it: &mut Args, key: &str) -> Result<OsString, String> {

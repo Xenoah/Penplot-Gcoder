@@ -65,7 +65,9 @@ def main():
                  "docs/TRAVEL_SMOOTHING.ja.md",
                  "examples/alignment-card.svg", "examples/calibration.dxf"):
         files[name] = Path(name)
-    for name in ("docs/studio-preview.png", "docs/studio-lifts.png"):
+    for name in ("docs/studio-preview.png", "docs/studio-lifts.png",
+                 "docs/screenshots/studio-v0.5.0-edit.png",
+                 "docs/screenshots/studio-v0.5.0-gcode-preview.png"):
         if Path(name).exists():
             files[name] = Path(name)
     docs = {name: file.read_bytes() for name, file in files.items()}

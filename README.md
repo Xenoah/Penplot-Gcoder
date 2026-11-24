@@ -31,6 +31,10 @@ SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリン�
 
 **G-code Preview → PATH PLANNING → Smooth pen-up travel (quadratic)** をオンにすると、条件に合う軌跡間の空走だけを緩い二次曲線にできます。既定はオフ。描画線・Z・速度は変えません。[空走曲線の使い方と限界](docs/TRAVEL_SMOOTHING.ja.md)
 
+### K9 の開始 G-code（v0.8.0）
+
+**G-code Preview → MACHINE PROFILE → EasyThreed K9 → START G-CODE** で、`M203 X100 Y100`・`M201 X200 Y200`・`M204 P100 T200` を初期値として編集できます。対応する設定命令は純正 AT32 の公開ダンプで確認しましたが、実機の安全性は未確認のため**出力は既定でオフ**。移動指令や EEPROM は変更しません。[設定方法と注意](docs/K9.md#開始-g-codek9-の実験設定)
+
 ### ソースからビルド
 
 Rustup とプラットフォームの C/C++ リンカーを準備する（Windows は Rust MSVC + Visual Studio Build Tools の C++ ワークロード）。リポジトリの `rust-toolchain.toml` が Rust 1.90.0 を選択し、`Cargo.lock` が依存関係を固定する。初回ビルドは依存関係をダウンロードする。実行時のネット接続は不要。

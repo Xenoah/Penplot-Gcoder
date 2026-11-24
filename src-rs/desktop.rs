@@ -1253,6 +1253,59 @@ impl Studio {
                     .changed();
             });
         }
+        if let Some(start) = &mut profile.k9_start_gcode {
+            ui.separator();
+            section(
+                ui,
+                if self.japanese {
+                    "開始 G-code"
+                } else {
+                    "START G-CODE"
+                },
+            );
+            changed |= ui
+                .checkbox(
+                    &mut start.enabled,
+                    if self.japanese {
+                        "K9 の実験的な速度・加速度設定を出力"
+                    } else {
+                        "Emit experimental K9 planner settings"
+                    },
+                )
+                .changed();
+            ui.small(if self.japanese {
+                "M203 X/Y、M201 X/Y、M204 P/T のみ。空走にも適用します。移動の F 値や EEPROM は変更しません。"
+            } else {
+                "Only M203 X/Y, M201 X/Y and M204 P/T. Also applies to air runs. Does not change commanded F or write EEPROM."
+            });
+            if start.enabled {
+                ui.colored_label(WARN, if self.japanese {
+                    "K9 実機・100 mm/s 未検証。最初はペンを外し、低速で監視してください。"
+                } else {
+                    "Not hardware-verified at 100 mm/s. First test slowly with the pen removed and supervise."
+                });
+            }
+            changed |= ui
+                .add(
+                    egui::TextEdit::multiline(&mut start.code)
+                        .code_editor()
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .char_limit(1024),
+                )
+                .changed();
+            if ui
+                .button(if self.japanese {
+                    "3 行の初期値に戻す（無効）"
+                } else {
+                    "Reset three lines and turn off"
+                })
+                .clicked()
+            {
+                *start = penplot::K9StartGcode::default();
+                changed = true;
+            }
+        }
         if changed {
             self.pending_export = None;
             self.invalidate();
@@ -2716,6 +2769,46 @@ mod tests {
         assert_eq!((moves[2].from.1, moves[2].to.1), (2.75, 6.25));
         assert_eq!((moves[3].from.1, moves[3].to.1), (6.25, 6.25));
         assert_eq!(moves.last().unwrap().to.1, 6.25);
+    }
+
+    #[test]
+    fn k9_start_edit_invalidates_old_exports_and_round_trips_in_projects() {
+        let mut app = Studio::default();
+        app.apply_machine_preset(None);
+        app.add_mark(vec![Point::new(10.0, 10.0), Point::new(25.0, 10.0)], false)
+            .unwrap();
+        app.rebuild();
+        let off = app.export_commands(true).unwrap();
+        assert!(!off.gcode.contains("M203"));
+        app.inspect_gcode(true);
+        let old_preview_revision = app.export_inspection.as_ref().unwrap().revision;
+
+        app.profile.k9_start_gcode.as_mut().unwrap().enabled = true;
+        app.invalidate();
+        assert!(app.export_commands(true).is_err());
+        assert_ne!(app.revision, old_preview_revision);
+        app.rebuild();
+        let on = app.export_commands(true).unwrap();
+        assert!(on.gcode.contains("M203 X100 Y100"));
+        assert_eq!(
+            off.gcode
+                .lines()
+                .filter(|l| l.starts_with("G1"))
+                .collect::<Vec<_>>(),
+            on.gcode
+                .lines()
+                .filter(|l| l.starts_with("G1"))
+                .collect::<Vec<_>>()
+        );
+        let encoded = app.as_project().to_json().unwrap();
+        let decoded = Project::from_json(&encoded).unwrap();
+        assert_eq!(decoded.profile.k9_start_gcode, app.profile.k9_start_gcode);
+
+        app.profile.k9_start_gcode.as_mut().unwrap().code = "G91".into();
+        app.invalidate();
+        app.rebuild();
+        assert!(app.export_commands(false).is_err() && app.export_commands(true).is_err());
+        assert!(app.error.as_ref().unwrap().contains("K9 start G-code"));
     }
 
     #[test]

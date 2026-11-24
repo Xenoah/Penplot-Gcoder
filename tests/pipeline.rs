@@ -248,6 +248,181 @@ fn cli_refuses_unsafe_exports_and_does_not_clobber() {
 }
 
 #[test]
+fn cli_k9_start_is_prefilled_but_only_emitted_when_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_penplot"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let write = |name, bytes: &[u8]| std::fs::write(dir.path().join(name), bytes).unwrap();
+    let read = |name| std::fs::read_to_string(dir.path().join(name)).unwrap();
+    write("art.svg", include_bytes!("../examples/alignment-card.svg"));
+    assert!(cmd(&["profile-init", "k9.json", "--k9"]).status.success());
+    let mut profile: serde_json::Value = serde_json::from_str(&read("k9.json")).unwrap();
+    let exact = "M203 X100 Y100\nM201 X200 Y200\nM204 P100 T200";
+    assert_eq!(profile["k9_start_gcode"]["code"], exact);
+    assert_eq!(profile["k9_start_gcode"]["enabled"], false);
+    let convert = |output, air| {
+        let mut args = vec![
+            "convert",
+            "--profile",
+            "k9.json",
+            "--calibrated",
+            "-o",
+            output,
+            "art.svg",
+        ];
+        if air {
+            args.insert(1, "--air-run");
+        }
+        cmd(&args)
+    };
+    assert!(convert("off.gcode", true).status.success());
+    let off = read("off.gcode");
+    assert!(!off.contains("M203"));
+    assert!(off.contains("F2400.000"));
+
+    profile["k9_start_gcode"]["enabled"] = true.into();
+    write("k9.json", &serde_json::to_vec(&profile).unwrap());
+    for (name, air) in [("on.gcode", false), ("air-on.gcode", true)] {
+        let result = convert(name, air);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let on = read(name);
+        assert!(on.contains(&format!(
+            "G21\nG90\n; K9 experimental planner settings (not saved by this file)\n{exact}\nG1 Z"
+        )));
+        assert_eq!(on.matches("M203").count(), 1);
+        assert!(on.contains("F2400.000"));
+        assert!(!on.contains("M500"));
+        assert_eq!(on.contains("G1 Z2.000"), !air);
+    }
+    assert_eq!(
+        read("air-on.gcode")
+            .lines()
+            .filter(|l| l.starts_with("G1"))
+            .collect::<Vec<_>>(),
+        off.lines()
+            .filter(|l| l.starts_with("G1"))
+            .collect::<Vec<_>>()
+    );
+
+    for disallowed in [
+        "M500",
+        "G91",
+        "G1 Z-4",
+        "M203 Z5",
+        "M203 X101",
+        "M201 X200 E200",
+        "M204 T500",
+        "M204 R100",
+        "M203 X100 X99",
+        "M203 X100 M500",
+        "M203 X100\rM500",
+        "M201 X100*15",
+    ] {
+        profile["k9_start_gcode"]["code"] = disallowed.into();
+        write("k9.json", &serde_json::to_vec(&profile).unwrap());
+        let result = convert("bad.gcode", true);
+        assert!(!result.status.success(), "accepted {disallowed}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("K9 start G-code line"));
+        assert!(!dir.path().join("bad.gcode").exists());
+    }
+
+    profile["k9_start_gcode"]["code"] = "M204 T150 P100 ; M500 is not executable".into();
+    write("k9.json", &serde_json::to_vec(&profile).unwrap());
+    assert!(convert("edit.gcode", true).status.success());
+    assert!(read("edit.gcode").contains("\nM204 T150 P100\n"));
+    assert!(!read("edit.gcode").contains("M500"));
+}
+
+#[test]
+fn cli_k9_start_and_quadratic_travel_coexist_without_changing_draw_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two strokes with nonparallel tangents, separated by a 20 mm pen-up link.
+    std::fs::write(
+        dir.path().join("two.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="50mm" height="50mm" viewBox="0 0 50 50"><path d="M5 45 L10 40 M30 40 L35 45" fill="none" stroke="black"/></svg>"#,
+    )
+    .unwrap();
+    let convert = |prefix: bool, smooth: bool, air: bool, out: &str| {
+        let mut profile = Profile::k9();
+        profile.k9_start_gcode.as_mut().unwrap().enabled = prefix;
+        std::fs::write(
+            dir.path().join("k9.json"),
+            serde_json::to_vec(&profile).unwrap(),
+        )
+        .unwrap();
+        let mut args = vec![
+            "convert",
+            "--profile",
+            "k9.json",
+            "--calibrated",
+            "--x",
+            "5",
+            "--y",
+            "5",
+            "-o",
+            out,
+            "two.svg",
+        ];
+        if smooth {
+            args.insert(1, "--smooth-pen-up");
+        }
+        if air {
+            args.insert(1, "--air-run");
+        }
+        let result = Command::new(env!("CARGO_BIN_EXE_penplot"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::read_to_string(dir.path().join(out)).unwrap()
+    };
+    let straight = convert(true, false, false, "STRAIGHT.GCODE");
+    let curve = convert(true, true, false, "CURVE.GCODE");
+    let curve_without_start = convert(false, true, false, "BASE.GCODE");
+    let air = convert(true, true, true, "AIR.GCODE");
+    let exact = "M203 X100 Y100\nM201 X200 Y200\nM204 P100 T200\n";
+    for output in [&straight, &curve, &air] {
+        assert_eq!(output.matches(exact).count(), 1);
+        assert!(output.contains(&format!("{exact}G1 Z")));
+    }
+    assert_eq!(
+        curve.replace(
+            &format!("; K9 experimental planner settings (not saved by this file)\n{exact}"),
+            ""
+        ),
+        curve_without_start
+    );
+    let lines = |g: &str, pred: fn(&str) -> bool| {
+        g.lines()
+            .filter(|l| pred(l))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let draw = |l: &str| l.starts_with("G1 X") && l.ends_with("F600.000");
+    let travel = |l: &str| l.starts_with("G1 X") && l.ends_with("F2400.000");
+    let z = |l: &str| l.starts_with("G1 Z");
+    assert_eq!(lines(&curve, draw), lines(&straight, draw));
+    assert_eq!(lines(&curve, z), lines(&straight, z));
+    assert!(lines(&curve, travel).len() > lines(&straight, travel).len());
+    assert_eq!(lines(&curve, travel), lines(&air, travel));
+    assert!(lines(&air, z).iter().all(|l| l.starts_with("G1 Z5.000")));
+}
+
+#[test]
 fn cli_project_roundtrip_matches_visible_gui_layer_route() {
     use penplot::{Project, ProjectLayer};
     let dir = tempfile::tempdir().unwrap();

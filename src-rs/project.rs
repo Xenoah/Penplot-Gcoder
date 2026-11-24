@@ -99,12 +99,13 @@ impl Project {
         if !(1..=SCHEMA).contains(&wire.version) {
             return Err(format!("Unsupported project version {}", wire.version));
         }
-        let project = Self {
+        let mut project = Self {
             layers: wire.layers,
             options: wire.options,
             profile: wire.profile,
             import_options: wire.import_options,
         };
+        project.profile.restore_k9_editor();
         project.validate()?;
         Ok(project)
     }

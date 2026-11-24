@@ -52,6 +52,85 @@ impl MachinePreset {
     }
 }
 
+/// A reviewable K9-only planner preamble. It is not a general G-code macro.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct K9StartGcode {
+    pub enabled: bool,
+    pub code: String,
+}
+
+impl Default for K9StartGcode {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            code: "M203 X100 Y100\nM201 X200 Y200\nM204 P100 T200".into(),
+        }
+    }
+}
+
+impl K9StartGcode {
+    const MAX_BYTES: usize = 1024;
+
+    /// Canonicalize output; never emit unparsed user text, comments, or whitespace.
+    fn commands(&self) -> Result<String, String> {
+        if self.code.len() > Self::MAX_BYTES {
+            return Err("K9 start G-code exceeds 1024 bytes".into());
+        }
+        let mut out = String::new();
+        if !self.enabled {
+            return Ok(out);
+        }
+        let mut seen = [false; 3];
+        for (index, raw) in self.code.lines().enumerate() {
+            let line = raw.split(';').next().unwrap_or_default();
+            let mut tokens = line.split_ascii_whitespace();
+            let Some(command) = tokens.next() else {
+                continue;
+            };
+            let fail = |why: &str| format!("K9 start G-code line {}: {why}", index + 1);
+            let (slot, allowed, limit) = match command {
+                "M203" => (0, *b"XY", 100),
+                "M201" => (1, *b"XY", 200),
+                "M204" => (2, *b"PT", 200),
+                _ => return Err(fail("only M203 X/Y, M201 X/Y and M204 P/T are allowed")),
+            };
+            if std::mem::replace(&mut seen[slot], true) {
+                return Err(fail("each command may appear once"));
+            }
+            let mut supplied = [false; 2];
+            out.push_str(command);
+            for token in tokens {
+                let (letter, digits) = token
+                    .as_bytes()
+                    .split_first()
+                    .ok_or_else(|| fail("missing parameter"))?;
+                let axis = allowed
+                    .iter()
+                    .position(|allowed| allowed == letter)
+                    .ok_or_else(|| fail("unexpected parameter; use space-separated X/Y or P/T"))?;
+                if std::mem::replace(&mut supplied[axis], true) {
+                    return Err(fail("duplicate parameter"));
+                }
+                let value = (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+                    .then(|| token[1..].parse::<u16>().ok())
+                    .flatten()
+                    .filter(|value| (1..=limit).contains(value))
+                    .ok_or_else(|| fail(&format!("use an integer from 1 to {limit}")))?;
+                write!(&mut out, " {}{value}", char::from(*letter)).expect("writing to String");
+            }
+            if !supplied.into_iter().any(|present| present) {
+                return Err(fail("at least one parameter is required"));
+            }
+            out.push('\n');
+        }
+        if out.is_empty() {
+            return Err("K9 start G-code is enabled but contains no commands".into());
+        }
+        Ok(out)
+    }
+}
+
 /// Paper coordinates are always left-bottom based. Center origin subtracts
 /// half the bed size from the commanded X/Y after adding the pen offsets.
 /// Limits and Z values are user-measured, never inferred from a firmware name.
@@ -81,6 +160,9 @@ pub struct Profile {
     pub pen_down_speed: f64,
     pub touchdown_delay: u32,
     pub liftup_delay: u32,
+    /// Presence marks the explicit K9 planner-preamble option, including while disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k9_start_gcode: Option<K9StartGcode>,
 }
 
 impl Default for Profile {
@@ -104,15 +186,29 @@ impl Default for Profile {
             pen_down_speed: 2.0,
             touchdown_delay: 0,
             liftup_delay: 0,
+            k9_start_gcode: None,
         }
     }
 }
 
 impl Profile {
+    const K9_NAME: &'static str = "EasyThreed K9 (manual HOME; measure before use)";
+
+    /// Restore the editor for a prior built-in K9 profile without changing calibrated values.
+    pub(crate) fn restore_k9_editor(&mut self) {
+        if self.machine_preset.is_none()
+            && self.k9_start_gcode.is_none()
+            && self.name == Self::K9_NAME
+        {
+            self.k9_start_gcode = Some(K9StartGcode::default());
+        }
+    }
+
     /// The bed and all motion values are starting points, not verified K9 limits.
     pub fn k9() -> Self {
         Self {
-            name: "EasyThreed K9 (manual HOME; measure before use)".to_owned(),
+            name: Self::K9_NAME.to_owned(),
+            k9_start_gcode: Some(K9StartGcode::default()),
             travel_speed: 40.0,
             ..Self::default()
         }
@@ -163,8 +259,9 @@ impl Profile {
         let obj = value.as_object().ok_or("Profile must be a JSON object")?;
         if obj.contains_key("version") {
             // Deserialize the original JSON to reject duplicate versioned fields.
-            let profile: Self =
+            let mut profile: Self =
                 serde_json::from_str(text).map_err(|e| format!("Invalid profile: {e}"))?;
+            profile.restore_k9_editor();
             profile.validate()?;
             return Ok((profile, Vec::new()));
         }
@@ -295,6 +392,12 @@ impl Profile {
                 "Voxelab Aries does not emit unverified G4 dwell commands. Set both delays to 0."
                     .into(),
             );
+        }
+        if let Some(start) = &self.k9_start_gcode {
+            if self.machine_preset.is_some() {
+                return Err("K9 start G-code is not supported by this machine preset".into());
+            }
+            start.commands()?;
         }
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err("XY offsets must be finite".into());
@@ -498,6 +601,15 @@ pub fn generate_with_travel(
         );
     }
     result.gcode.push_str("G21\nG90\n");
+    if let Some(start) = &profile.k9_start_gcode
+        && start.enabled
+    {
+        result
+            .gcode
+            .push_str("; K9 experimental planner settings (not saved by this file)\n");
+        result.gcode.push_str(&start.commands()?);
+    }
+
     z_line(&mut result.gcode, up, profile.pen_up_speed);
     let mut last_end: Option<[Point; 2]> = None;
     for (index, stroke) in strokes.iter().enumerate() {
@@ -700,6 +812,33 @@ mod tests {
             let quadratic = generate_with_travel(&paths, &profile, false, true).unwrap();
             assert!(quadratic.curved_travel.is_empty());
             assert_eq!(direct.gcode, quadratic.gcode);
+        }
+    }
+
+    #[test]
+    fn native_prior_k9_profiles_gain_the_off_editor_without_changing_output() {
+        let mut json = serde_json::to_value(Profile::k9()).unwrap();
+        json.as_object_mut().unwrap().remove("k9_start_gcode");
+        json["travel_speed"] = 36.0.into();
+        json["pen_up_z"] = 7.15.into();
+        let old: Profile = serde_json::from_value(json.clone()).unwrap();
+        let (new, _) = Profile::from_json(&json.to_string()).unwrap();
+        assert_eq!(new.k9_start_gcode, Some(K9StartGcode::default()));
+        assert_eq!(new.travel_speed, 36.0);
+        assert_eq!(new.pen_up_z, 7.15);
+        let art = [stroke(&[(1.0, 2.0), (3.0, 2.0)], false)];
+        assert_eq!(
+            generate(&art, &new).unwrap().gcode,
+            generate(&art, &old).unwrap().gcode
+        );
+        for preset in [MachinePreset::BambuP1s, MachinePreset::VoxelabAries] {
+            let mut foreign = Profile::for_machine(preset);
+            assert!(foreign.k9_start_gcode.is_none());
+            foreign.k9_start_gcode = Some(K9StartGcode {
+                enabled: true,
+                ..Default::default()
+            });
+            assert!(generate(&art, &foreign).is_err());
         }
     }
 
