@@ -11,10 +11,14 @@ mod machine;
 mod project;
 mod text_layer;
 pub mod text_outline;
+mod travel_curve;
 pub use geometry::{
     Fill, JobOptions, PlanResult, RasterLayers, RasterSettings, fit, plan, plan_with_raster,
 };
-pub use machine::{MachinePreset, Origin, Output, Profile, generate, generate_air_run};
+pub use machine::{
+    CurvedTravel, MachinePreset, Origin, Output, Profile, generate, generate_air_run,
+    generate_with_travel,
+};
 pub use project::{Project, ProjectLayer};
 pub use text_layer::TextLayer;
 

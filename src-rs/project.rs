@@ -269,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_projects_default_to_straight_and_opt_in_persists() {
+        let mut project = blank();
+        let old = project.to_json().unwrap();
+        assert!(!std::str::from_utf8(&old).unwrap().contains("smooth_pen_up"));
+        assert!(!Project::from_json(&old).unwrap().options.smooth_pen_up);
+        project.options.smooth_pen_up = true;
+        assert!(
+            Project::from_json(&project.to_json().unwrap())
+                .unwrap()
+                .options
+                .smooth_pen_up
+        );
+    }
+
+    #[test]
     fn rejects_unknown_versions_duplicates_and_any_calibration_field() {
         let bytes = blank().to_json().unwrap();
         let raw = std::str::from_utf8(&bytes).unwrap();

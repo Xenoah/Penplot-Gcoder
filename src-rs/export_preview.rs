@@ -287,6 +287,39 @@ mod tests {
     }
 
     #[test]
+    fn preview_matches_rounded_curve_in_plot_and_air_modes() {
+        let mut profile = Profile::default();
+        profile.origin = Origin::Center;
+        profile.offset_x = 0.25;
+        profile.offset_y = -0.125;
+        let paths = [
+            path(&[(5., 5.), (10., 10.)]),
+            path(&[(30., 10.), (35., 5.)]),
+        ];
+        let plot = penplot::generate_with_travel(&paths, &profile, false, true).unwrap();
+        let air = penplot::generate_with_travel(&paths, &profile, true, true).unwrap();
+        let preview = CommandPreview::from_commands(&plot.gcode, &profile, false, 99);
+        let dry = CommandPreview::from_commands(&air.gcode, &profile, true, 99);
+        let curve = &plot.curved_travel[0].paper_points;
+        assert_eq!(preview.down_count, 2);
+        assert_eq!(preview.up_count, curve.len() - 1);
+        assert_eq!(dry.down_count, 0);
+        assert_eq!(dry.up_count, preview.up_count + preview.down_count);
+        for (segment, expected) in preview
+            .segments
+            .iter()
+            .filter(|p| p.pen_up)
+            .zip(curve.windows(2))
+        {
+            assert!(segment.a.distance(expected[0]) < 1e-10);
+            assert!(segment.b.distance(expected[1]) < 1e-10);
+        }
+        for (regular, dry) in preview.segments.iter().zip(&dry.segments) {
+            assert_eq!((regular.a, regular.b), (dry.a, dry.b));
+        }
+    }
+
+    #[test]
     fn retains_full_pen_state_counts_when_display_is_sampled() {
         let paths = [path(&[
             (2.0, 2.0),

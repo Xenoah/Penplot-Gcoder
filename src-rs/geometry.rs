@@ -22,6 +22,8 @@ pub struct JobOptions {
     pub x: f64,
     pub y: f64,
     pub optimize: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub smooth_pen_up: bool,
     pub fill: Fill,
     pub hatch_spacing: f64,
     pub hatch_angle: f64,
@@ -36,12 +38,16 @@ impl Default for JobOptions {
             x: 0.,
             y: 0.,
             optimize: false,
+            smooth_pen_up: false,
             fill: Fill::None,
             hatch_spacing: 1.,
             hatch_angle: 45.,
             min_image_stroke_mm: 0.,
         }
     }
+}
+fn is_false(value: &bool) -> bool {
+    !value
 }
 fn is_zero(value: &f64) -> bool {
     *value == 0.0

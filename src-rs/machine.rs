@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 const SCHEMA: u32 = 1;
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_POINTS: usize = 1_000_000;
+const MAX_CURVE_EXTRA_POINTS: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -339,6 +340,24 @@ impl Profile {
         Ok(())
     }
 
+    fn paper_point(&self, point: Point) -> Point {
+        let (cx, cy) = match self.origin {
+            Origin::LeftBottom => (0.0, 0.0),
+            Origin::Center => (self.bed_x / 2.0, self.bed_y / 2.0),
+        };
+        Point::new(point.x + cx - self.offset_x, point.y + cy - self.offset_y)
+    }
+
+    fn curve_point(&self, point: Point) -> Option<Point> {
+        let paper = self.paper_point(point);
+        let (x0, y0, x1, y1) = self.effective_area();
+        // Do not clip a proposed bend at the limit; keep the straight link.
+        if !(x0..=x1).contains(&paper.x) || !(y0..=y1).contains(&paper.y) {
+            return None;
+        }
+        self.command_point(paper).ok()
+    }
+
     fn command_point(&self, point: Point) -> Result<Point, String> {
         let (x0, y0, x1, y1) = self.effective_area();
         // Permit arithmetic noise at edges (e.g. rotating by 90 degrees), never
@@ -373,11 +392,20 @@ impl Profile {
 }
 
 #[derive(Debug)]
+pub struct CurvedTravel {
+    /// Index of the destination stroke in the planner's input.
+    pub destination_stroke: usize,
+    /// Rounded command points returned to the paper frame, including both endpoints.
+    pub paper_points: Vec<Point>,
+}
+
+#[derive(Debug)]
 pub struct Output {
     pub gcode: String,
     pub draw_mm: f64,
     /// Travel from one stroke to the next. The initial XY is unknown.
     pub travel_mm: f64,
+    pub curved_travel: Vec<CurvedTravel>,
     /// Nominal movement and dwell only; excludes initial XY/Z, acceleration,
     /// firmware overhead, and any homing done manually before running.
     pub seconds: f64,
@@ -413,21 +441,38 @@ fn distance(a: Point, b: Point) -> f64 {
 /// after machine rounding are ignored; separate strokes are never joined.
 /// Assumes the operator verified limits, manually homed, and cleared travel.
 pub fn generate(strokes: &[Stroke], profile: &Profile) -> Result<Output, String> {
-    generate_job(strokes, profile, false)
+    generate_with_travel(strokes, profile, false, false)
 }
 
 /// Uses the same XY geometry and feeds, but never lowers the pen. Full profile
 /// validation and manual homing are still required.
 pub fn generate_air_run(strokes: &[Stroke], profile: &Profile) -> Result<Output, String> {
-    generate_job(strokes, profile, true)
+    generate_with_travel(strokes, profile, true, false)
 }
 
-fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<Output, String> {
+/// Emits plot or air-run G-code, optionally using bounded, checked quadratic
+/// links in the pen-up phase. Drawing moves and all Z commands are unchanged.
+pub fn generate_with_travel(
+    strokes: &[Stroke],
+    profile: &Profile,
+    air_run: bool,
+    smooth_pen_up: bool,
+) -> Result<Output, String> {
     profile.validate()?;
     if let Some(reason) = profile.export_blocker() {
         return Err(reason.into());
     }
     let mut remaining = MAX_POINTS;
+    let mut curve_budget = if smooth_pen_up {
+        let baseline = strokes.iter().fold(0_usize, |sum, stroke| {
+            sum.saturating_add(stroke.points.len().saturating_add(1))
+        });
+        MAX_POINTS
+            .saturating_sub(baseline)
+            .min(MAX_CURVE_EXTRA_POINTS)
+    } else {
+        0
+    };
     let up = rounded(profile.pen_up_z + profile.offset_z);
     let down = rounded(profile.pen_down_z + profile.offset_z);
     let mut result = Output {
@@ -439,6 +484,7 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
         .to_owned(),
         draw_mm: 0.0,
         travel_mm: 0.0,
+        curved_travel: Vec::new(),
         seconds: 0.0,
         air_seconds: 0.0,
     };
@@ -453,7 +499,7 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
     }
     result.gcode.push_str("G21\nG90\n");
     z_line(&mut result.gcode, up, profile.pen_up_speed);
-    let mut current = None;
+    let mut last_end: Option<[Point; 2]> = None;
     for (index, stroke) in strokes.iter().enumerate() {
         remaining = remaining
             .checked_sub(stroke.points.len().saturating_add(1))
@@ -480,7 +526,29 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
             points.push(first);
         }
 
-        if let Some(previous) = current {
+        if let Some(prior) = last_end {
+            let mut previous = prior[1];
+            if let Some(vertices) =
+                crate::travel_curve::between(prior, [first, points[1]], curve_budget, |p| {
+                    profile.curve_point(p)
+                })
+            {
+                curve_budget -= vertices.len();
+                let paper_points = std::iter::once(previous)
+                    .chain(vertices.iter().copied())
+                    .chain(std::iter::once(first))
+                    .map(|p| profile.paper_point(p))
+                    .collect();
+                result.curved_travel.push(CurvedTravel {
+                    destination_stroke: index,
+                    paper_points,
+                });
+                for vertex in vertices {
+                    result.travel_mm += distance(previous, vertex);
+                    xy_line(&mut result.gcode, vertex, profile.travel_speed);
+                    previous = vertex;
+                }
+            }
             result.travel_mm += distance(previous, first);
         }
         xy_line(&mut result.gcode, first, profile.travel_speed);
@@ -501,9 +569,9 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
         let dwell = f64::from(profile.touchdown_delay + profile.liftup_delay) / 1000.0;
         result.air_seconds += dwell;
         lift_seconds += (up - down) / profile.pen_up_speed + (up - down) / profile.pen_down_speed;
-        current = points.last().copied();
+        last_end = Some([points[points.len() - 2], points[points.len() - 1]]);
     }
-    if current.is_none() {
+    if last_end.is_none() {
         return Err("No drawable strokes at command resolution".into());
     }
     result.air_seconds +=
@@ -523,6 +591,115 @@ mod tests {
             layer: "Example".into(),
             group: 0,
             filled: false,
+        }
+    }
+
+    #[test]
+    fn curved_links_add_only_up_moves_and_match_air_run() {
+        let profile = Profile {
+            touchdown_delay: 23,
+            liftup_delay: 31,
+            ..Profile::k9()
+        };
+        let paths = [
+            stroke(&[(5., 5.), (10., 10.)], false),
+            stroke(&[(30., 10.), (35., 5.)], false),
+        ];
+        let straight = generate(&paths, &profile).unwrap();
+        let off = generate_with_travel(&paths, &profile, false, false).unwrap();
+        let curve = generate_with_travel(&paths, &profile, false, true).unwrap();
+        let air = generate_with_travel(&paths, &profile, true, true).unwrap();
+        assert_eq!(straight.gcode, off.gcode);
+        assert!(straight.curved_travel.is_empty());
+        assert_eq!(curve.curved_travel.len(), 1);
+        let link = &curve.curved_travel[0];
+        assert_eq!(link.destination_stroke, 1);
+        assert_eq!(link.paper_points.first(), Some(&Point::new(10., 10.)));
+        assert_eq!(link.paper_points.last(), Some(&Point::new(30., 10.)));
+        assert!(link.paper_points[1].y > 10.);
+        assert!(link.paper_points.iter().all(|p| p.y <= 10.751));
+        assert!(
+            link.paper_points
+                .windows(2)
+                .all(|pair| pair[1].x > pair[0].x)
+        );
+        let travel: f64 = link
+            .paper_points
+            .windows(2)
+            .map(|p| p[0].distance(p[1]))
+            .sum();
+        assert!((curve.travel_mm - travel).abs() < 1e-10);
+        assert!(curve.travel_mm > straight.travel_mm);
+        assert_eq!(curve.draw_mm, straight.draw_mm);
+        assert!(
+            (curve.seconds
+                - straight.seconds
+                - (curve.travel_mm - straight.travel_mm) / profile.travel_speed)
+                .abs()
+                < 1e-10
+        );
+        assert_eq!(curve.air_seconds, air.seconds);
+
+        fn split(gcode: &str) -> (Vec<&str>, Vec<&str>) {
+            gcode.lines().partition(|line| line.starts_with("G1 X"))
+        }
+        let (straight_xy, straight_other) = split(&straight.gcode);
+        let (curve_xy, curve_other) = split(&curve.gcode);
+        let (air_xy, air_other) = split(&air.gcode);
+        assert_eq!(curve_xy, air_xy);
+        assert_eq!(straight_other, curve_other);
+        assert!(
+            air_other
+                .iter()
+                .filter(|line| line.starts_with("G1 Z"))
+                .all(|line| line.starts_with("G1 Z5.000 "))
+        );
+        assert_eq!(&curve_xy[..2], &straight_xy[..2]);
+        assert_eq!(
+            &curve_xy[curve_xy.len() - 2..],
+            &straight_xy[straight_xy.len() - 2..]
+        );
+        let up = curve
+            .gcode
+            .split("G4 P31\nG1 Z5.000 F120.000\n")
+            .nth(1)
+            .unwrap()
+            .split("G1 Z2.000 ")
+            .next()
+            .unwrap();
+        assert_eq!(up.lines().count(), link.paper_points.len() - 1);
+        assert!(
+            up.lines()
+                .all(|line| line.starts_with("G1 X") && line.ends_with(" F2400.000"))
+        );
+    }
+
+    #[test]
+    fn straight_short_and_out_of_bounds_controls_fall_back() {
+        let profile = Profile {
+            origin: Origin::Center,
+            offset_y: 1.0,
+            ..Profile::default()
+        };
+        let examples = [
+            [
+                stroke(&[(5., 10.), (10., 10.)], false),
+                stroke(&[(30., 10.), (35., 10.)], false),
+            ],
+            [
+                stroke(&[(5., 5.), (10., 10.)], false),
+                stroke(&[(11., 10.), (15., 5.)], false),
+            ],
+            [
+                stroke(&[(5., 94.), (10., 99.)], false),
+                stroke(&[(30., 99.), (35., 94.)], false),
+            ],
+        ];
+        for paths in examples {
+            let direct = generate(&paths, &profile).unwrap();
+            let quadratic = generate_with_travel(&paths, &profile, false, true).unwrap();
+            assert!(quadratic.curved_travel.is_empty());
+            assert_eq!(direct.gcode, quadratic.gcode);
         }
     }
 

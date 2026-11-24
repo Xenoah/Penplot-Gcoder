@@ -1,4 +1,6 @@
-use penplot::{MachinePreset, Point, Profile, Stroke, generate, generate_air_run};
+use penplot::{
+    MachinePreset, Point, Profile, Stroke, generate, generate_air_run, generate_with_travel,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -156,4 +158,49 @@ fn cli_creates_presets_and_does_not_write_unapproved_machine_files() {
     let gcode = fs::read_to_string(work.join("airrun.gcode")).unwrap();
     assert!(gcode.contains("Z8.000"));
     assert!(!gcode.contains("Z3.000"));
+}
+
+#[test]
+fn smooth_travel_does_not_bypass_preset_export_z_or_dwell_limits() {
+    let mut strokes = paths().to_vec();
+    strokes[0].points = vec![Point::new(5., 5.), Point::new(10., 10.)];
+    strokes.push(Stroke {
+        points: vec![Point::new(30., 10.), Point::new(35., 5.)],
+        ..strokes[0].clone()
+    });
+    let mut p1s = Profile::for_machine(MachinePreset::BambuP1s);
+    p1s.pen_down_z = 2.;
+    p1s.pen_up_z = 6.;
+    p1s.check_layout(&strokes).unwrap();
+    for air in [false, true] {
+        assert!(
+            generate_with_travel(&strokes, &p1s, air, true)
+                .unwrap_err()
+                .contains("layout-only")
+        );
+    }
+    let mut aries = Profile::for_machine(MachinePreset::VoxelabAries);
+    aries.pen_down_z = 2.;
+    aries.pen_up_z = 6.;
+    aries.offset_z = 0.5;
+    let plot = generate_with_travel(&strokes, &aries, false, true).unwrap();
+    let dry = generate_with_travel(&strokes, &aries, true, true).unwrap();
+    assert_eq!(plot.curved_travel.len(), 1);
+    assert_eq!(
+        plot.curved_travel[0].paper_points,
+        dry.curved_travel[0].paper_points
+    );
+    assert!(!plot.gcode.lines().any(|line| line.starts_with("G4")));
+    assert!(
+        dry.gcode
+            .lines()
+            .filter(|line| line.starts_with("G1 Z"))
+            .all(|line| line.starts_with("G1 Z6.500 "))
+    );
+    aries.liftup_delay = 1;
+    assert!(
+        generate_with_travel(&strokes, &aries, false, true)
+            .unwrap_err()
+            .contains("G4")
+    );
 }

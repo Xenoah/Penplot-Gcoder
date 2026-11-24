@@ -23,6 +23,7 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --spacing MM         hatch spacing (default 1); --angle DEG (default 45)
   --min-image-stroke MM omit raster strokes shorter than MM after placement (0 = off)
   --optimize           reduce lifts' travel within contiguous layer runs
+  --smooth-pen-up      opt in to quadratic smoothing of eligible pen-up links
   --dpi N              PNG/JPEG physical scale (default 96)
   --threshold 0..255   raster foreground brightness cutoff (default 128)
   --invert             select bright instead of dark pixels
@@ -161,6 +162,7 @@ fn run(mut it: Args) -> Result<(), String> {
             "--rotate" => opts.rotation_deg = num(&mut it, "--rotate")?,
             "--min-image-stroke" => minimum = Some(num(&mut it, "--min-image-stroke")?),
             "--optimize" => opts.optimize = true,
+            "--smooth-pen-up" => opts.smooth_pen_up = true,
             "--hatch" => {
                 opts.fill = match value(&mut it, "--hatch")?.to_str() {
                     Some("lines") => Fill::Lines,
@@ -272,11 +274,7 @@ fn run(mut it: Args) -> Result<(), String> {
         println!("{} paths | layout only: {reason}", routes.len());
         return Ok(());
     }
-    let program = if air {
-        penplot::generate_air_run(&routes, &p)
-    } else {
-        penplot::generate(&routes, &p)
-    }?;
+    let program = penplot::generate_with_travel(&routes, &p, air, opts.smooth_pen_up)?;
     println!(
         "{} paths | draw {:.2} mm | travel between paths {:.2} mm | ideal motion {:.1} s | {}",
         routes.len(),

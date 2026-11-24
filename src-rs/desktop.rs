@@ -902,7 +902,13 @@ impl Studio {
             return Err(self.export_unavailable_reason());
         }
         if air_run {
-            penplot::generate_air_run(&self.planned, &self.profile).map(Arc::new)
+            penplot::generate_with_travel(
+                &self.planned,
+                &self.profile,
+                true,
+                self.options.smooth_pen_up,
+            )
+            .map(Arc::new)
         } else {
             self.output
                 .clone()
@@ -1362,6 +1368,17 @@ impl Studio {
         let mut changed = ui
             .checkbox(&mut draft.optimize, "Reduce pen-up travel")
             .changed();
+        changed |= ui.checkbox(&mut draft.smooth_pen_up, "Smooth pen-up travel (quadratic)")
+            .on_hover_text("Off by default. Curves eligible pen-up links, not drawn lines. Firmware still controls acceleration.")
+            .changed();
+        if draft.smooth_pen_up
+            && let Some(output) = &self.output
+        {
+            ui.small(format!(
+                "{} curved links in current route.",
+                output.curved_travel.len()
+            ));
+        }
         let label = match draft.fill {
             Fill::None => "Outlines only",
             Fill::Lines => "Hatch lines",
@@ -1498,7 +1515,12 @@ fn calculate_plan(revision: u64, snapshot: &Snapshot, profile: &Profile) -> Plan
         let output = if plan.strokes.is_empty() {
             Err("No drawable paths remain after filtering".into())
         } else {
-            penplot::generate(&plan.strokes, profile)
+            penplot::generate_with_travel(
+                &plan.strokes,
+                profile,
+                false,
+                snapshot.options.smooth_pen_up,
+            )
         };
         Ok((plan.strokes, output))
     });
@@ -2083,8 +2105,11 @@ impl Studio {
             );
         }
         let canvas = painter.clip_rect().expand(2.0);
-        trace_segments(
+        trace_segments_with_curves(
             &self.planned[..self.shown.min(self.planned.len())],
+            self.output
+                .as_deref()
+                .map_or(&[], |output| &output.curved_travel),
             up,
             down,
             |segment| {
@@ -2176,6 +2201,11 @@ impl Studio {
     ) {
         let mut previous = None;
         let clipped = painter.clip_rect().expand(2.0);
+        let mut curves = self
+            .output
+            .iter()
+            .flat_map(|output| &output.curved_travel)
+            .peekable();
         for (index, stroke) in self.planned.iter().enumerate() {
             let Some(&first) = stroke.points.first() else {
                 continue;
@@ -2186,12 +2216,19 @@ impl Studio {
                 && self.show_travel
                 && let Some(last) = previous
             {
-                paint_dashes(
-                    painter,
-                    last,
-                    start,
-                    Ink::new(1.2, Color32::from_rgb(209, 114, 59)),
-                );
+                let ink = Ink::new(1.2, Color32::from_rgb(209, 114, 59));
+                if let Some(curve) = curves.next_if(|curve| curve.destination_stroke == index) {
+                    for points in curve.paper_points.windows(2) {
+                        paint_dashes(
+                            painter,
+                            map.screen(transform(points[0])),
+                            map.screen(transform(points[1])),
+                            ink,
+                        );
+                    }
+                } else {
+                    paint_dashes(painter, last, start, ink);
+                }
             }
             let color = if active {
                 route_color(&stroke.layer)
@@ -2453,15 +2490,33 @@ struct TraceSegment {
     kind: MoveKind,
 }
 
-fn trace_segments(strokes: &[Stroke], up: f64, down: f64, mut emit: impl FnMut(TraceSegment)) {
+#[cfg(test)]
+fn trace_segments(strokes: &[Stroke], up: f64, down: f64, emit: impl FnMut(TraceSegment)) {
+    trace_segments_with_curves(strokes, &[], up, down, emit);
+}
+
+fn trace_segments_with_curves(
+    strokes: &[Stroke],
+    curves: &[penplot::CurvedTravel],
+    up: f64,
+    down: f64,
+    mut emit: impl FnMut(TraceSegment),
+) {
     let mut previous = None;
+    let mut curves = curves.iter().peekable();
     let mut line = |from, to, kind| emit(TraceSegment { from, to, kind });
-    for stroke in strokes {
+    for (index, stroke) in strokes.iter().enumerate() {
         let Some(&first) = stroke.points.first() else {
             continue;
         };
         if let Some(last) = previous {
-            line((last, up), (first, up), MoveKind::Travel);
+            if let Some(curve) = curves.next_if(|curve| curve.destination_stroke == index) {
+                for points in curve.paper_points.windows(2) {
+                    line((points[0], up), (points[1], up), MoveKind::Travel);
+                }
+            } else {
+                line((last, up), (first, up), MoveKind::Travel);
+            }
         }
         line((first, up), (first, down), MoveKind::Lower);
         let mut last = first;
@@ -2984,6 +3039,43 @@ mod tests {
         assert_eq!(map.screen(point), Pos2::new(166.0, 215.0));
         let actual = map.paper(map.screen(point));
         assert_eq!((actual.x, actual.y), (point.x, point.y));
+    }
+
+    #[test]
+    fn tab_preview_and_air_export_share_current_curve_setting() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(5., 5.), Point::new(10., 10.)], false)
+            .unwrap();
+        app.add_mark(vec![Point::new(30., 10.), Point::new(35., 5.)], false)
+            .unwrap();
+        app.rebuild();
+        assert!(app.export_commands(false).unwrap().curved_travel.is_empty());
+        app.record_layers();
+        app.options.smooth_pen_up = true;
+        app.invalidate();
+        assert!(app.export_commands(false).is_err());
+        app.rebuild();
+        let plot = app.export_commands(false).unwrap();
+        let air = app.export_commands(true).unwrap();
+        let curve = &plot.curved_travel[0];
+        assert_eq!(curve.paper_points, air.curved_travel[0].paper_points);
+        let mut points = Vec::new();
+        trace_segments_with_curves(&app.planned, &plot.curved_travel, 5.0, 2.0, |segment| {
+            if segment.kind == MoveKind::Travel {
+                assert_eq!((segment.from.1, segment.to.1), (5.0, 5.0));
+                points.push((segment.from.0, segment.to.0));
+            }
+        });
+        assert_eq!(
+            points,
+            curve
+                .paper_points
+                .windows(2)
+                .map(|p| (p[0], p[1]))
+                .collect::<Vec<_>>()
+        );
+        app.undo();
+        assert!(!app.options.smooth_pen_up);
     }
 
     #[test]
