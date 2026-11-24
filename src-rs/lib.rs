@@ -14,7 +14,7 @@ pub mod text_outline;
 pub use geometry::{
     Fill, JobOptions, PlanResult, RasterLayers, RasterSettings, fit, plan, plan_with_raster,
 };
-pub use machine::{Origin, Output, Profile, generate, generate_air_run};
+pub use machine::{MachinePreset, Origin, Output, Profile, generate, generate_air_run};
 pub use project::{Project, ProjectLayer};
 pub use text_layer::TextLayer;
 

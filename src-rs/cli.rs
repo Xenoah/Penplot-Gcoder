@@ -1,5 +1,5 @@
 //! Thin CLI: it never opens a serial port and shares the exact desktop pipeline.
-use penplot::{Fill, ImportOptions, JobOptions, Profile, TraceMode};
+use penplot::{Fill, ImportOptions, JobOptions, MachinePreset, Profile, TraceMode};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   penplot check [OPTIONS] ART.svg [SECOND.dxf ...]
   penplot convert --profile MEASURED.json --calibrated -o DRAW.GCODE [OPTIONS] ART
   penplot convert --calibrated [--air-run] -o DRAW.GCODE SAVED.penplot
-  penplot profile-init OUTPUT.json [--k9]
+  penplot profile-init OUTPUT.json [--k9 | --p1s | --aries]
   penplot profile-migrate OLD.json OUTPUT.json
 
   --profile FILE       measured native JSON, or migrate a legacy printer preset
@@ -34,6 +34,9 @@ Output never overwrites an existing file. Both modes preflight the final command
 'check' can use the demo profile. Export requires a project or a measured profile.
 Projects use their saved visible layers, placement and profile; no setting overrides.
 No machine access, homing, extrusion, heating or motor disable commands.
+P1S is layout-only. Aries output is experimental and requires measured Z values.
+In profile JSON, pen_down_z (Draw Z) and pen_up_z (Clearance Z) are separate
+absolute heights in mm from the same active/homed Z origin; offset_z adds to both.
 "#;
 type Args = std::vec::IntoIter<OsString>;
 fn value(it: &mut Args, key: &str) -> Result<OsString, String> {
@@ -82,10 +85,13 @@ fn run(mut it: Args) -> Result<(), String> {
         }
         "profile-init" => {
             let out = PathBuf::from(value(&mut it, "output profile")?);
-            let p = match it.next().as_deref().and_then(|v| v.to_str()) {
+            let selection = it.next();
+            let p = match selection.as_deref().map(|v| v.to_str()) {
                 None => Profile::default(),
-                Some("--k9") => Profile::k9(),
-                _ => return Err("Expected only --k9 after the output path".into()),
+                Some(Some("--k9")) => Profile::k9(),
+                Some(Some("--p1s")) => Profile::for_machine(MachinePreset::BambuP1s),
+                Some(Some("--aries")) => Profile::for_machine(MachinePreset::VoxelabAries),
+                _ => return Err("Expected --k9, --p1s or --aries after the output path".into()),
             };
             if it.next().is_some() {
                 return Err("Unexpected profile-init arguments".into());
@@ -258,6 +264,13 @@ fn run(mut it: Args) -> Result<(), String> {
     let routes = plan.strokes;
     if routes.is_empty() {
         return Err("No drawable paths remain after filtering".into());
+    }
+    if action == "check"
+        && let Some(reason) = p.export_blocker()
+    {
+        p.check_layout(&routes)?;
+        println!("{} paths | layout only: {reason}", routes.len());
+        return Ok(());
     }
     let program = if air {
         penplot::generate_air_run(&routes, &p)

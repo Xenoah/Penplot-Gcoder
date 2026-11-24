@@ -16,6 +16,41 @@ pub enum Origin {
     Center,
 }
 
+/// Hardware families whose output restrictions must survive JSON/project saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachinePreset {
+    BambuP1s,
+    VoxelabAries,
+}
+
+impl MachinePreset {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BambuP1s => "Bambu Lab P1S",
+            Self::VoxelabAries => "Voxelab Aries",
+        }
+    }
+
+    pub const fn nominal_size_mm(self) -> f64 {
+        match self {
+            Self::BambuP1s => 256.0,
+            Self::VoxelabAries => 200.0,
+        }
+    }
+
+    pub const fn notice(self) -> &'static str {
+        match self {
+            Self::BambuP1s => {
+                "Layout only. P1S cold homing, tool clearance and job-file compatibility are not verified. Do not run raw plot G-code as a Bambu print job."
+            }
+            Self::VoxelabAries => {
+                "Experimental. Measure the homed origin, usable area, XY offsets and both absolute Z heights with your own mount. The manual lists .gcode over USB; cold plot execution is not hardware-verified."
+            }
+        }
+    }
+}
+
 /// Paper coordinates are always left-bottom based. Center origin subtracts
 /// half the bed size from the commanded X/Y after adding the pen offsets.
 /// Limits and Z values are user-measured, never inferred from a firmware name.
@@ -24,14 +59,19 @@ pub enum Origin {
 pub struct Profile {
     version: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_preset: Option<MachinePreset>,
     pub bed_x: f64,
     pub bed_y: f64,
     pub max_z: f64,
     pub origin: Origin,
     pub offset_x: f64,
     pub offset_y: f64,
+    /// Added to both absolute Z heights; never a relative lift distance.
     pub offset_z: f64,
+    /// Clearance target in mm from the homed/active Z origin, before offset_z.
     pub pen_up_z: f64,
+    /// Drawing/contact target in mm from the same origin, before offset_z.
     pub pen_down_z: f64,
     /// All speeds in the profile are in mm/s; emitted G-code F is mm/min.
     pub draw_speed: f64,
@@ -47,6 +87,7 @@ impl Default for Profile {
         Self {
             version: SCHEMA,
             name: "Demo (measure before use)".to_owned(),
+            machine_preset: None,
             bed_x: 100.0,
             bed_y: 100.0,
             max_z: 10.0,
@@ -73,6 +114,42 @@ impl Profile {
             name: "EasyThreed K9 (manual HOME; measure before use)".to_owned(),
             travel_speed: 40.0,
             ..Self::default()
+        }
+    }
+
+    pub fn for_machine(preset: MachinePreset) -> Self {
+        let size = preset.nominal_size_mm();
+        Self {
+            name: preset.name().to_owned(),
+            machine_preset: Some(preset),
+            bed_x: size,
+            bed_y: size,
+            max_z: size,
+            // Equal zero is an explicit "unmeasured" state, not a commandable
+            // tool position. Do not copy a K9 or illustrative gap.
+            pen_up_z: 0.0,
+            pen_down_z: 0.0,
+            ..Self::default()
+        }
+    }
+
+    fn has_unmeasured_z(&self) -> bool {
+        self.machine_preset.is_some()
+            && self.pen_up_z == 0.0
+            && self.pen_down_z == 0.0
+            && self.offset_z == 0.0
+    }
+
+    /// Same gate in Studio, CLI and the public G-code generator.
+    pub fn export_blocker(&self) -> Option<&'static str> {
+        match self.machine_preset {
+            Some(MachinePreset::BambuP1s) => Some(
+                "Bambu Lab P1S is layout-only: raw G-code export is not enabled until cold homing and job compatibility are verified.",
+            ),
+            Some(MachinePreset::VoxelabAries) if self.has_unmeasured_z() => {
+                Some("Enter measured Draw Z and Clearance Z before exporting for Voxelab Aries.")
+            }
+            _ => None,
         }
     }
 
@@ -185,6 +262,18 @@ impl Profile {
                 return Err(format!("Invalid {label}: specify 0.001–10000 mm"));
             }
         }
+        if let Some(preset) = self.machine_preset {
+            let nominal = preset.nominal_size_mm();
+            if [self.bed_x, self.bed_y, self.max_z]
+                .into_iter()
+                .any(|dimension| dimension > nominal)
+            {
+                return Err(format!(
+                    "Configured travel exceeds the nominal {nominal} mm size for {}",
+                    preset.name()
+                ));
+            }
+        }
         for (label, value, max) in [
             ("draw speed", self.draw_speed, 300.0),
             ("travel speed", self.travel_speed, 300.0),
@@ -198,6 +287,14 @@ impl Profile {
         if self.touchdown_delay > 60_000 || self.liftup_delay > 60_000 {
             return Err("Pen delays must be between 0 and 60000 ms".into());
         }
+        if self.machine_preset == Some(MachinePreset::VoxelabAries)
+            && (self.touchdown_delay != 0 || self.liftup_delay != 0)
+        {
+            return Err(
+                "Voxelab Aries does not emit unverified G4 dwell commands. Set both delays to 0."
+                    .into(),
+            );
+        }
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err("XY offsets must be finite".into());
         }
@@ -207,6 +304,9 @@ impl Profile {
         }
         if !(-10_000.0..=10_000.0).contains(&self.offset_z) {
             return Err("Z offset must be finite and within ±10000 mm".into());
+        }
+        if self.has_unmeasured_z() {
+            return Ok(()); // Valid as a saved profile/layout; not as machine output.
         }
         let (up, down) = (
             self.pen_up_z + self.offset_z,
@@ -219,6 +319,22 @@ impl Profile {
         }
         if up <= down || rounded(up) <= rounded(down) {
             return Err("Pen-up Z must exceed pen-down Z at 0.001 mm command resolution".into());
+        }
+        Ok(())
+    }
+
+    /// Preflight XY placement without creating runnable machine code.
+    pub fn check_layout(&self, strokes: &[Stroke]) -> Result<(), String> {
+        self.validate()?;
+        let mut remaining = MAX_POINTS;
+        for (index, stroke) in strokes.iter().enumerate() {
+            remaining = remaining
+                .checked_sub(stroke.points.len().saturating_add(1))
+                .ok_or("Layout exceeds the point limit")?;
+            for (point_index, &point) in stroke.points.iter().enumerate() {
+                self.command_point(point)
+                    .map_err(|e| format!("Path {}, point {}: {e}", index + 1, point_index + 1))?;
+            }
         }
         Ok(())
     }
@@ -308,6 +424,9 @@ pub fn generate_air_run(strokes: &[Stroke], profile: &Profile) -> Result<Output,
 
 fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<Output, String> {
     profile.validate()?;
+    if let Some(reason) = profile.export_blocker() {
+        return Err(reason.into());
+    }
     let mut remaining = MAX_POINTS;
     let up = rounded(profile.pen_up_z + profile.offset_z);
     let down = rounded(profile.pen_down_z + profile.offset_z);
@@ -326,7 +445,13 @@ fn generate_job(strokes: &[Stroke], profile: &Profile, air_run: bool) -> Result<
     let mut lift_seconds = 0.0;
     result
         .gcode
-        .push_str("; Penplot-Gcoder / manual HOME before run\nG21\nG90\n");
+        .push_str("; Penplot-Gcoder / manual HOME before run\n");
+    if profile.machine_preset == Some(MachinePreset::VoxelabAries) {
+        result.gcode.push_str(
+            "; Voxelab Aries experimental: verify cold playback and absolute XYZ with pen removed\n",
+        );
+    }
+    result.gcode.push_str("G21\nG90\n");
     z_line(&mut result.gcode, up, profile.pen_up_speed);
     let mut current = None;
     for (index, stroke) in strokes.iter().enumerate() {

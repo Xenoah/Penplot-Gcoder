@@ -61,7 +61,8 @@ def main():
     if target not in {"x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"}:
         raise SystemExit("Expected Windows x64 MSVC or GNU target")
     files = {name: Path(binary_dir) / name for name in ("penplot-studio.exe", "penplot.exe")}
-    for name in ("README.md", "docs/K9.md", "examples/alignment-card.svg", "examples/calibration.dxf"):
+    for name in ("README.md", "docs/K9.md", "docs/MACHINE-PRESETS.md",
+                 "examples/alignment-card.svg", "examples/calibration.dxf"):
         files[name] = Path(name)
     for name in ("docs/studio-preview.png", "docs/studio-lifts.png"):
         if Path(name).exists():

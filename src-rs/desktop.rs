@@ -5,8 +5,8 @@
 
 use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke as Ink, Vec2};
 use penplot::{
-    Artwork, Fill, ImportOptions, JobOptions, Origin, Output, Point, Profile, Project,
-    ProjectLayer, Stroke,
+    Artwork, Fill, ImportOptions, JobOptions, MachinePreset, Origin, Output, Point, Profile,
+    Project, ProjectLayer, Stroke,
 };
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -393,6 +393,9 @@ impl Studio {
                 self.inspect_gcode(self.air_first);
             }
         });
+        if let Some(reason) = self.profile.export_blocker() {
+            ui.colored_label(WARN, reason);
+        }
         ui.separator();
         self.workspace_tabs(ui);
         ui.add_space(5.0);
@@ -880,12 +883,12 @@ impl Studio {
             .show(ctx, |ui| {
                 if self.japanese {
                     ui.label("1. Import で図面を読み込みます。Fit to usable bed で描画範囲に収めます。");
-                    ui.label("2. Machine で実測した Z・オフセット・可動範囲を設定し、確認欄にチェックします。");
+                    ui.label("2. Machine で原点から実測した描画 Z・退避 Z、オフセット、可動範囲を設定します。");
                     ui.label("3. 機械側でペンを逃がして原点復帰し、まず Air run（ペン上げのみ）で干渉を確認します。");
                     ui.label("4. 問題なければ Air run first を外して描画用 G-code を出力します。");
                 } else {
                     ui.label("1. Import your drawing and use Fit to usable bed if needed.");
-                    ui.label("2. Enter measured Z, offsets and travel limits in Machine before running on hardware.");
+                    ui.label("2. Enter measured Draw Z, Clearance Z, offsets and travel limits in Machine before running on hardware.");
                     ui.label("3. Home manually with clearance; export and verify a pen-up air run.");
                     ui.label("4. Uncheck Air run first only when ready to export the drawing file.");
                 }
@@ -929,20 +932,23 @@ impl Studio {
                 return;
             }
         };
+        let aries = self.profile.machine_preset == Some(MachinePreset::VoxelabAries);
+        let (name, extension) = match (aries, air_run) {
+            (true, true) => ("airrun.gcode", "gcode"),
+            (true, false) => ("plot.gcode", "gcode"),
+            (false, true) => ("AIRRUN.GCODE", "GCODE"),
+            (false, false) => ("PLOT.GCODE", "GCODE"),
+        };
         let mut dialog = rfd::FileDialog::new()
             .add_filter("G-code", &["GCODE", "gcode"])
-            .set_file_name(if air_run {
-                "AIRRUN.GCODE"
-            } else {
-                "PLOT.GCODE"
-            });
+            .set_file_name(name);
         if let Some(directory) = self.last_export_dir.as_deref() {
             dialog = dialog.set_directory(directory);
         }
         if let Some(mut path) = dialog.save_file() {
             let overwrite_confirmed_by_dialog = path.extension().is_some();
             if !overwrite_confirmed_by_dialog {
-                path.set_extension("GCODE");
+                path.set_extension(extension);
             }
             match penplot::save_file(
                 &path,
@@ -1154,15 +1160,37 @@ impl Studio {
             if ui.button("Save JSON…").clicked() {
                 self.save_profile();
             }
-            if ui.button("Use K9").clicked() {
-                self.profile = Profile::k9();
-                self.profile_notices.clear();
-                self.status =
-                    "Loaded K9 starting values. Measure your machine before export.".into();
-                self.invalidate();
-                ui.ctx().request_repaint();
-            }
         });
+        let mut picked = None;
+        egui::ComboBox::from_id_salt("machine_preset")
+            .width(ui.available_width().min(240.0))
+            .selected_text("Load a machine preset…")
+            .show_ui(ui, |ui| {
+                if ui.button("EasyThreed K9").clicked() {
+                    picked = Some(None);
+                    ui.close();
+                }
+                for (preset, suffix) in [
+                    (MachinePreset::BambuP1s, "layout only"),
+                    (MachinePreset::VoxelabAries, "experimental"),
+                ] {
+                    if ui
+                        .button(format!("{} ({suffix})", preset.name()))
+                        .on_hover_text(preset.notice())
+                        .clicked()
+                    {
+                        picked = Some(Some(preset));
+                        ui.close();
+                    }
+                }
+            });
+        if let Some(preset) = picked {
+            self.apply_machine_preset(preset);
+            ui.ctx().request_repaint();
+        }
+        if let Some(preset) = self.profile.machine_preset {
+            ui.colored_label(WARN, preset.notice());
+        }
         ui.add_space(4.0);
         let profile = &mut self.profile;
         let mut changed = ui
@@ -1187,28 +1215,40 @@ impl Studio {
             });
         changed |= number(ui, "Command offset X (mm)", &mut profile.offset_x, 0.1);
         changed |= number(ui, "Command offset Y (mm)", &mut profile.offset_y, 0.1);
-        changed |= number(ui, "Command offset Z (mm)", &mut profile.offset_z, 0.1);
+        ui.separator();
+        section(ui, "PEN HEIGHTS • ABSOLUTE");
+        ui.small(if self.japanese {
+            "描画と退避は、どちらも機械の原点 Z=0 からの絶対位置です。差分ではありません。共通補正は両方に加算します。"
+        } else {
+            "Draw and clearance are absolute targets from the same active Z=0 after homing, not a lift distance. The common offset adds to both."
+        });
+        changed |= number(ui, "Draw Z (mm)", &mut profile.pen_down_z, 0.1);
+        changed |= number(ui, "Clearance Z (mm)", &mut profile.pen_up_z, 0.1);
+        changed |= number(ui, "Common Z offset (mm)", &mut profile.offset_z, 0.1);
         ui.separator();
         section(ui, "PEN & SPEED");
-        changed |= number(ui, "Pen up Z (mm)", &mut profile.pen_up_z, 0.1);
-        changed |= number(ui, "Pen down Z (mm)", &mut profile.pen_down_z, 0.1);
         changed |= number(ui, "Pen up (mm/s)", &mut profile.pen_up_speed, 0.1);
         changed |= number(ui, "Pen down (mm/s)", &mut profile.pen_down_speed, 0.1);
         changed |= number(ui, "Draw (mm/s)", &mut profile.draw_speed, 0.5);
         changed |= number(ui, "Travel (mm/s)", &mut profile.travel_speed, 0.5);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("After pen down (ms)");
-            changed |= ui
-                .add(egui::DragValue::new(&mut profile.touchdown_delay).speed(5))
-                .changed();
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Before pen up (ms)");
-            changed |= ui
-                .add(egui::DragValue::new(&mut profile.liftup_delay).speed(5))
-                .changed();
-        });
+        if profile.machine_preset == Some(MachinePreset::VoxelabAries) {
+            ui.small("Aries: G4 dwell is not emitted.");
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("After pen down (ms)");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut profile.touchdown_delay).speed(5))
+                    .changed();
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Before pen up (ms)");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut profile.liftup_delay).speed(5))
+                    .changed();
+            });
+        }
         if changed {
+            self.pending_export = None;
             self.invalidate();
             ui.ctx().request_repaint();
         }
@@ -1221,12 +1261,29 @@ impl Studio {
         }
     }
 
+    fn apply_machine_preset(&mut self, preset: Option<MachinePreset>) {
+        self.pending_export = None;
+        self.profile = preset.map(Profile::for_machine).unwrap_or_else(Profile::k9);
+        self.profile_notices.clear();
+        if let Some(preset) = preset {
+            self.air_first = true;
+            self.status = preset.notice().into();
+        } else {
+            self.status = "Loaded K9 starting values. Measure your machine before export.".into();
+        }
+        self.invalidate();
+    }
+
     fn load_profile(&mut self, path: &Path) {
         match penplot::read_limited(path)
             .and_then(|data| String::from_utf8(data).map_err(|error| error.to_string()))
             .and_then(|text| Profile::from_json(&text))
         {
             Ok((profile, notices)) => {
+                self.pending_export = None;
+                if profile.machine_preset.is_some() {
+                    self.air_first = true;
+                }
                 self.profile = profile;
                 self.profile_notices = notices;
                 self.status =
@@ -1342,7 +1399,8 @@ impl Studio {
     }
 
     fn can_export(&self) -> bool {
-        self.output.is_some()
+        self.profile.export_blocker().is_none()
+            && self.output.is_some()
             && !self.planned.is_empty()
             && !self.preview_dirty
             && self.placement_drag.is_none()

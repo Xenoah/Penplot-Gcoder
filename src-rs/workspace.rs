@@ -146,6 +146,12 @@ impl Studio {
     }
 
     fn preview_workspace(&mut self, ui: &mut egui::Ui) {
+        if let Some(reason) = self.profile.export_blocker() {
+            ui.heading("G-code Preview");
+            ui.colored_label(super::WARN, reason);
+            ui.label("You can inspect the artwork layout in Edit. This profile does not expose runnable commands here.");
+            return;
+        }
         if self.export_inspection.is_none() && self.can_export() {
             self.inspect_gcode(self.air_first);
         }
@@ -181,6 +187,8 @@ impl Studio {
             "Wait for the import to finish before exporting.".into()
         } else if self.placement_drag.is_some() {
             "Finish or cancel the current placement gesture before exporting.".into()
+        } else if let Some(reason) = self.profile.export_blocker() {
+            reason.into()
         } else if let Some(error) = &self.error {
             format!("Cannot export: {error}")
         } else if !self.layers.iter().any(|layer| layer.visible) {
@@ -222,6 +230,58 @@ impl Studio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_machine_presets_cancels_pending_export_without_losing_artwork() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10., 10.), Point::new(30., 20.)], false)
+            .unwrap();
+        app.rebuild();
+        assert!(app.can_export());
+        app.inspect_gcode(false);
+
+        app.pending_export = Some(false);
+        app.air_first = false;
+        app.apply_machine_preset(Some(MachinePreset::BambuP1s));
+        app.rebuild();
+        assert!(app.pending_export.is_none());
+        assert!(!app.can_export());
+        assert!(app.air_first);
+        assert!(
+            app.export_commands(false)
+                .unwrap_err()
+                .contains("layout-only")
+        );
+        assert!(
+            app.export_commands(true)
+                .unwrap_err()
+                .contains("layout-only")
+        );
+        assert_eq!(app.planned.len(), 1);
+        assert_eq!(app.layers.len(), 1);
+
+        app.apply_machine_preset(Some(MachinePreset::VoxelabAries));
+        app.rebuild();
+        assert!(!app.can_export());
+        assert!(app.export_unavailable_reason().contains("measured Draw Z"));
+        app.profile.pen_up_z = 6.;
+        app.profile.pen_down_z = 2.;
+        app.invalidate();
+        app.rebuild();
+        assert!(app.can_export());
+        assert!(
+            app.export_commands(false)
+                .unwrap()
+                .gcode
+                .contains("G1 Z2.000")
+        );
+        assert!(
+            !app.export_commands(true)
+                .unwrap()
+                .gcode
+                .contains("G1 Z2.000")
+        );
+    }
 
     #[test]
     fn tabs_preserve_document_camera_selection_import_options_and_export_snapshot() {
