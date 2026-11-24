@@ -2,6 +2,16 @@
 
 SVG・DXF・画像を読み込み、3D プリンター用のペン描画経路を編集・検査して `.GCODE` に保存するオフラインの Rust デスクトップアプリ。Windows 向け GUI と、GUI なしで同じファイルを生成できる CLI がある。**Python・クラウド・プリンターへの接続は不要**。
 
+## 最新版 v0.5.0 の実画面
+
+[Windows x64 配布版 v0.5.0](https://github.com/Xenoah/Penplot-Gcoder/releases/tag/v0.5.0) ／ [v0.5.0 の使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/7f6b5e4c770ffae7fb2132b418d6e0285f36e1ca/README.md)
+
+次の 2 枚は、v0.5.0 の Linux 版で撮影した画面です。この下にある `main` のソースからの手順・画面例は、旧版 v0.1.0 向けです。
+
+![編集：左にツール、中央に描画面、右にレイヤー](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/7f6b5e4c770ffae7fb2132b418d6e0285f36e1ca/docs/screenshots/studio-v0.5.0-edit.png)
+
+![G-code Preview：機械設定、ペンの経路、生成コマンド](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/7f6b5e4c770ffae7fb2132b418d6e0285f36e1ca/docs/screenshots/studio-v0.5.0-gcode-preview.png)
+
 ![実際の Studio の 2D プレビュー。実線は描画・オレンジ破線は移動経路](docs/studio-preview.png)
 
 ## まず試す（実機なし）
