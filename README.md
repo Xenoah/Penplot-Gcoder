@@ -15,6 +15,12 @@ SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリン�
 
 ## ワークスペース（v0.5.0）
 
+**実画面（v0.5.0、Linux 版）**
+
+![編集タブ：左にツール、中央に描画面、右にレイヤー](docs/screenshots/studio-v0.5.0-edit.png)
+
+![G-code Preview タブ：K9 の機械設定、ペンの経路、生成コマンド](docs/screenshots/studio-v0.5.0-gcode-preview.png)
+
 - **Edit**: 左にツールボックスとツールオプション、中央にキャンバス、右にレイヤー。Move / Scale は統合のまま、回転・図形・文字・Delete・右クリックを使用できます。
 - **Import**: ファイルの取り込みと画像の Threshold / Outline / Centerline / Fill を調整します。取り込み途中でもタブを往復でき、設定と最後の有効なプレビューを保持します。Add image で確定、Cancel でその画像を取り消します。
 - **G-code Preview**: 左に機械・経路設定、中央に出力コマンドのプレビュー、右にレイヤー。既存のスナップショットは自動で置き換えず、更新後は「以前のコマンド」と表示します。Refresh from current job で現在の結果を確認できます。
