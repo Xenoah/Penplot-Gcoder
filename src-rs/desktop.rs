@@ -26,13 +26,15 @@ use workspace::Workspace;
 mod raster_ui;
 use raster_ui::RasterImport;
 
+const APP_NAME: &str = "Penplot-Gcoder";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
         #[cfg(target_os = "windows")]
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("Penplot-Gcoder Studio")
+            .set_title(APP_NAME)
             .set_description(&error)
             .show();
         std::process::exit(1);
@@ -234,7 +236,7 @@ pub fn run() -> Result<(), String> {
         ..Default::default()
     };
     eframe::run_native(
-        "Penplot-Gcoder Studio",
+        APP_NAME,
         options,
         Box::new(|cc| {
             let mut visuals = egui::Visuals::dark();

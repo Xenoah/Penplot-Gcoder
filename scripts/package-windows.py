@@ -1,4 +1,4 @@
-"""Package already-built native Studio + CLI with docs, examples and dependency notices.
+"""Package already-built native Penplot-Gcoder GUI + CLI with docs, examples and dependency notices.
 
 Developer convenience only; the two executables do not need Python or Cargo.
 Usage: python scripts/package-windows.py x86_64-pc-windows-msvc target/release output.zip
@@ -18,7 +18,7 @@ def notices(target):
         "--filter-platform", target,
     ]))
     texts = [
-        "Penplot Studio | Third-party components",
+        "Penplot-Gcoder | Third-party components",
         "Cargo package notices, declarations and bundled font license texts follow.",
         "The metadata inventory can include optional or build-time components.",
     ]
@@ -72,7 +72,7 @@ def main():
             files[name] = Path(name)
     docs = {name: file.read_bytes() for name, file in files.items()}
     version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
-    docs["VERSION.txt"] = f"Penplot-Gcoder Studio v{version}\nTarget: {target}\n".encode("utf-8")
+    docs["VERSION.txt"] = f"Penplot-Gcoder v{version}\nTarget: {target}\n".encode("utf-8")
     docs["THIRD-PARTY-NOTICES.txt"] = notices(target).encode()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for name, data in sorted(docs.items()):

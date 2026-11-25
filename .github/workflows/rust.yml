@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
-          echo "name=Penplot-Studio-v${version}-Windows-x64" >> "$GITHUB_OUTPUT"
+          echo "name=Penplot-Gcoder-v${version}-Windows-x64" >> "$GITHUB_OUTPUT"
       - name: Package Windows binaries, examples and attributions
         if: runner.os == 'Windows'
         run: python scripts/package-windows.py x86_64-pc-windows-msvc target/release ${{ steps.package-name.outputs.name }}.zip

@@ -2,7 +2,7 @@
 
 Studio の **G-code Preview → MACHINE PROFILE → Load a machine preset…** から選択します。選び直すと実測値は初期値に戻るため、調整後は JSON またはプロジェクトに保存してください。図面とレイヤーを作り直す必要はありません。
 
-| 機種 | 公称造形範囲 (X × Y × Z) | Penplot Studio |
+| 機種 | 公称造形範囲 (X × Y × Z) | Penplot-Gcoder |
 | --- | --- | --- |
 | EasyThreed K9 | このアプリの初期設定は 100 × 100 × 10 mm | 従来と同じ。[K9 ガイド](K9.md)を参照。 |
 | Bambu Lab P1S | 256 × 256 × 256 mm | **レイアウトのみ**。G-code のプレビュー・コピー・出力を停止。|

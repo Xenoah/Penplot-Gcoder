@@ -1,8 +1,8 @@
-# Penplot-Gcoder Studio
+# Penplot-Gcoder
 
 SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリンター用のペン描画経路を編集・検査して `.GCODE` に保存するオフラインの Rust デスクトップアプリ。Windows 向け GUI と、GUI なしで同じファイルを生成できる CLI がある。**Python・クラウド・プリンターへの接続は不要**。
 
-![実際の Studio の 2D プレビュー。実線は描画・オレンジ破線は移動経路](docs/studio-preview.png)
+![Penplot-Gcoder の 2D プレビュー。実線は描画・オレンジ破線は移動経路](docs/studio-preview.png)
 
 ## まず試す（実機なし）
 
