@@ -132,4 +132,6 @@ Rust の入口は `src-rs/lib.rs`（変換）、`src-rs/desktop.rs`（GUI）、`
 
 Click a line in Pan, Move / Scale or Rotate to select its object, or select a row in the Layers list. Imported SVG/DXF/images are selected as whole layers; a canvas mark is selected as one continuous stroke. A layer row always targets that whole layer. Delete or the scoped right-click menu removes the selected object, and Ctrl+Z restores it (Ctrl+Y / Ctrl+Shift+Z redo). Right-clicking blank canvas clears the selection. Text/number editing, dialogs, import work and active drags keep their own keys. Deleting an object preserves the placement of the remaining artwork and invalidates generated output until replanning finishes.
 
+The layer stack shows an eye button, a checkerboard geometry thumbnail, and the layer name in each row. Click the row to select it or the eye to toggle drawing/export visibility without repositioning the other visible layers. Blend modes and opacity are not used for pen output.
+
 **Move / Scale** and **Rotate** transform only the selected layer, including when a mark on that layer is selected. Drag a corner to resize about the opposite corner, or enter Width or Height in mm to resize proportionally from the lower-left. Only the explicit **Fit to usable bed** operation fits all visible layers together.

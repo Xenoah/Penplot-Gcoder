@@ -88,6 +88,185 @@ fn hit_test(
         })
 }
 
+const ROW_HEIGHT: f32 = 30.0;
+const EYE_WIDTH: f32 = 26.0;
+
+fn layer_eye(ui: &mut egui::Ui, visible: bool) -> egui::Response {
+    let response = ui.add_sized([EYE_WIDTH, ROW_HEIGHT], egui::Button::new("").frame(false));
+    let label = if visible { "Hide layer" } else { "Show layer" };
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), visible, label)
+    });
+    let pos = response.rect.center();
+    let painter = ui.painter();
+    let ink = Ink::new(1.35, ui.style().interact(&response).text_color());
+    let p = |x, y| pos + egui::vec2(x, y);
+    painter.add(egui::Shape::closed_line(
+        vec![
+            p(-8., 0.),
+            p(-5., -2.8),
+            p(-2., -4.),
+            p(2., -4.),
+            p(5., -2.8),
+            p(8., 0.),
+            p(5., 2.8),
+            p(2., 4.),
+            p(-2., 4.),
+            p(-5., 2.8),
+        ],
+        ink,
+    ));
+    if visible {
+        painter.circle_filled(pos, 2.2, ink.color);
+    } else {
+        painter.line_segment([p(-7., 6.), p(7., -6.)], ink);
+    }
+    response.on_hover_text(label)
+}
+
+#[derive(Clone)]
+struct LayerPreview {
+    source: std::sync::Weak<[Stroke]>,
+    lines: Arc<[([Pos2; 2], Color32)]>,
+}
+
+fn layer_preview(strokes: &Arc<[Stroke]>) -> LayerPreview {
+    let loop_points =
+        |stroke: &Stroke| stroke.points.len().saturating_sub(1) + usize::from(stroke.closed);
+    let stride = strokes
+        .iter()
+        .map(loop_points)
+        .sum::<usize>()
+        .div_ceil(720)
+        .max(1);
+    let mut min = Point::new(f64::INFINITY, f64::INFINITY);
+    let mut max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for point in strokes.iter().flat_map(|stroke| &stroke.points) {
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+    }
+    let span = (max.x - min.x).max(max.y - min.y);
+    let mut lines = Vec::new();
+    if span.is_finite() && span > 0.0 {
+        let unit = |p: Point| {
+            Pos2::new(
+                ((p.x - min.x - (max.x - min.x) * 0.5) / span) as f32,
+                ((max.y - p.y - (max.y - min.y) * 0.5) / span) as f32,
+            )
+        };
+        let mut skipped = 0;
+        for stroke in strokes.iter().filter(|stroke| stroke.points.len() >= 2) {
+            let color = route_color(&stroke.layer);
+            let mut a = stroke.points[0];
+            for &b in stroke.points[1..]
+                .iter()
+                .chain(stroke.closed.then_some(&stroke.points[0]))
+            {
+                if skipped == 0 {
+                    lines.push(([unit(a), unit(b)], color));
+                }
+                skipped = (skipped + 1) % stride;
+                a = b;
+            }
+        }
+    }
+    LayerPreview {
+        source: Arc::downgrade(strokes),
+        lines: lines.into(),
+    }
+}
+
+fn layer_row(ui: &mut egui::Ui, index: usize, layer: &Layer, selected: bool) -> egui::Response {
+    let response = ui.add_sized(
+        [ui.available_width(), ROW_HEIGHT],
+        egui::Button::selectable(selected, ""),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            &layer.name,
+        )
+    });
+    let thumb = Rect::from_min_size(
+        Pos2::new(response.rect.left() + 5., response.rect.center().y - 11.),
+        egui::vec2(30., 22.),
+    );
+    let painter = ui.painter().with_clip_rect(response.rect);
+    for row in 0..3 {
+        for col in 0..4 {
+            let tile = Rect::from_min_max(
+                thumb.min + egui::vec2(col as f32 * 7.5, row as f32 * (22. / 3.)),
+                thumb.min + egui::vec2((col + 1) as f32 * 7.5, (row + 1) as f32 * (22. / 3.)),
+            );
+            painter.rect_filled(
+                tile,
+                0.,
+                Color32::from_gray(if (row + col) % 2 == 0 { 201 } else { 235 }),
+            );
+        }
+    }
+    let cache_id = ui.id().with(("layer_thumbnail", index));
+    let preview = ui.data_mut(|data| {
+        if let Some(old) = data.get_temp::<LayerPreview>(cache_id)
+            && old
+                .source
+                .upgrade()
+                .is_some_and(|source| Arc::ptr_eq(&source, &layer.strokes))
+        {
+            return old;
+        }
+        let preview = layer_preview(&layer.strokes);
+        data.insert_temp(cache_id, preview.clone());
+        preview
+    });
+    for (line, color) in preview.lines.iter() {
+        painter.line_segment(
+            line.map(|p| thumb.center() + p.to_vec2() * 17.),
+            Ink::new(1.35, *color),
+        );
+    }
+    painter.rect_stroke(
+        thumb,
+        1.,
+        Ink::new(
+            1.,
+            if selected {
+                ui.visuals().selection.stroke.color
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke.color
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if !layer.visible {
+        painter.rect_filled(thumb, 0., Color32::from_black_alpha(105));
+    }
+    let left = thumb.right() + 7.;
+    let color = if layer.visible {
+        ui.style().interact(&response).text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        layer.name.clone(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+    job.wrap.max_width = (response.rect.right() - left - 5.).max(0.);
+    job.wrap.max_rows = 1;
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    painter.galley(
+        Pos2::new(left, response.rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    response.on_hover_text(format!("{}\n{} paths", layer.name, layer.strokes.len()))
+}
+
 impl Studio {
     pub(super) fn build_route_targets(&self) -> Vec<Option<Selection>> {
         let Ok(combined) = self.combined() else {
@@ -305,6 +484,24 @@ impl Studio {
         }
     }
 
+    // Visibility changes the planner's minimum point, not the paper placement.
+    fn set_layer_visibility(&mut self, index: usize, visible: bool) {
+        let (sin, cos) = self
+            .options
+            .rotation_deg
+            .rem_euclid(360.)
+            .to_radians()
+            .sin_cos();
+        let scale = self.options.scale;
+        let before = projected_min(&self.layers, scale, sin, cos);
+        self.layers[index].visible = visible;
+        if let (Some(before), Some(after)) = (before, projected_min(&self.layers, scale, sin, cos))
+        {
+            self.options.x += after.x - before.x;
+            self.options.y += after.y - before.y;
+        }
+    }
+
     pub(super) fn artwork_panel(&mut self, ui: &mut egui::Ui) {
         section(ui, "LAYERS");
         if self.layers.is_empty() {
@@ -319,23 +516,15 @@ impl Studio {
         for (index, layer) in self.layers.iter().enumerate() {
             ui.add_enabled_ui(!blocked, |ui| {
                 ui.horizontal(|ui| {
-                    let mut visible = layer.visible;
-                    if ui
-                        .checkbox(&mut visible, "")
-                        .on_hover_text("Include in drawing")
-                        .changed()
-                    {
-                        action = Some((index, LayerAction::Visibility(visible)));
+                    if layer_eye(ui, layer.visible).clicked() {
+                        action = Some((index, LayerAction::Visibility(!layer.visible)));
                     }
-                    let response = ui
-                        .add(
-                            egui::Button::selectable(
-                                selected.is_some_and(|s| s.layer() == index),
-                                &layer.name,
-                            )
-                            .wrap(),
-                        )
-                        .on_hover_text(format!("{} paths", layer.strokes.len()));
+                    let response = layer_row(
+                        ui,
+                        index,
+                        layer,
+                        selected.is_some_and(|s| s.layer() == index),
+                    );
                     let target = Selection::Layer(index);
                     if response.clicked() {
                         selected = Some(target);
@@ -371,6 +560,7 @@ impl Studio {
                 })
             });
         }
+        ui.separator();
         self.selected = selected;
         self.object_context = context;
         if let Some(target) = self.selected.filter(|&target| self.valid_selection(target)) {
@@ -413,7 +603,7 @@ impl Studio {
         } else if let Some((index, action)) = action {
             self.record_layers();
             match action {
-                LayerAction::Visibility(visible) => self.layers[index].visible = visible,
+                LayerAction::Visibility(visible) => self.set_layer_visibility(index, visible),
                 LayerAction::Move(target) => {
                     self.layers.swap(index, target);
                     self.selected = self.selected.map(|s| s.with_layer(target));
@@ -645,6 +835,73 @@ mod tests {
             vec![key(Key::Delete, egui::Modifiers::NONE)],
         );
         assert_eq!(app.layers[0].strokes.len(), 2);
+    }
+
+    #[test]
+    fn layer_eye_toggles_output_without_selecting_or_shifting_the_neighbor() {
+        let mut app = Studio::default();
+        app.options.optimize = false;
+        app.add_mark(vec![Point::new(10., 10.), Point::new(20., 20.)], false)
+            .unwrap();
+        let mut second = app.layers[0].clone();
+        second.name = "Second layer".into();
+        let mut strokes = second.strokes.to_vec();
+        strokes[0].points = vec![Point::new(50., 50.), Point::new(70., 70.)];
+        second.strokes = strokes.into();
+        app.layers.push(second);
+        app.selected = Some(Selection::Layer(1));
+        app.invalidate();
+        app.rebuild();
+        let initial_commands = app.export_commands(false).unwrap().gcode.clone();
+        let fixed = app.planned[1].points.clone();
+        let ctx = egui::Context::default();
+        let panel = |app: &mut Studio, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(216., 500.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.artwork_panel(ui));
+                },
+            )
+        };
+        let output = panel(&mut app, vec![]);
+        let eye = output
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Circle(shape) if (shape.radius - 2.2).abs() < 1e-4 => {
+                    Some(shape.center)
+                }
+                _ => None,
+            })
+            .expect("visible layer eye");
+        let mouse = |pressed| egui::Event::PointerButton {
+            pos: eye,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        panel(&mut app, vec![egui::Event::PointerMoved(eye), mouse(true)]);
+        panel(&mut app, vec![mouse(false)]);
+        assert!(!app.layers[0].visible);
+        assert_eq!(app.selected, Some(Selection::Layer(1)));
+        app.rebuild();
+        assert_eq!(app.planned.len(), 1);
+        assert_eq!(app.planned[0].points, fixed);
+        assert!(
+            !app.export_commands(false)
+                .unwrap()
+                .gcode
+                .contains("X20.000 Y20.000")
+        );
+        panel(&mut app, vec![egui::Event::PointerMoved(eye), mouse(true)]);
+        panel(&mut app, vec![mouse(false)]);
+        assert!(app.layers[0].visible);
+        app.rebuild();
+        assert_eq!(app.export_commands(false).unwrap().gcode, initial_commands);
     }
 
     #[test]
