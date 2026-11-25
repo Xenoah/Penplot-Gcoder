@@ -214,7 +214,7 @@ impl Profile {
             name: Self::K9_NAME.to_owned(),
             k9_start_gcode: Some(K9StartGcode::default()),
             travel_speed: 40.0,
-            draw_speed: 20.0,
+            draw_speed: 30.0,
             liftup_delay: 30,
             k9_lift_mm: Some(2.0),
             ..Self::default()
@@ -1060,7 +1060,7 @@ mod tests {
         let default = Profile::default();
         let k9 = Profile::k9();
         assert_eq!(k9.travel_speed, 40.0);
-        assert_eq!(k9.draw_speed, 20.0);
+        assert_eq!(k9.draw_speed, 30.0);
         assert_eq!(k9.pen_up_speed, default.pen_up_speed);
         assert_eq!(k9.pen_down_speed, default.pen_down_speed);
         let (legacy, _) = Profile::from_json(include_str!("../profiles/printers/K9.json")).unwrap();
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(native.travel_speed, default.travel_speed);
         let output = generate(&[stroke(&[(10.0, 10.0), (20.0, 10.0)], false)], &k9).unwrap();
         assert!(output.gcode.contains("G1 X10.000 Y10.000 F2400.000"));
-        assert!(output.gcode.contains("G1 X20.000 Y10.000 F1200.000"));
+        assert!(output.gcode.contains("G1 X20.000 Y10.000 F1800.000"));
     }
 
     #[test]

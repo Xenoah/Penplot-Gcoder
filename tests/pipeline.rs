@@ -414,7 +414,7 @@ fn cli_k9_start_and_quadratic_travel_coexist_without_changing_draw_commands() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    let draw = |l: &str| l.starts_with("G1 X") && l.ends_with("F1200.000");
+    let draw = |l: &str| l.starts_with("G1 X") && l.ends_with("F1800.000");
     let travel = |l: &str| l.starts_with("G1 X") && l.ends_with("F2400.000");
     let z = |l: &str| l.starts_with("G1 Z");
     assert_eq!(lines(&curve, draw), lines(&straight, draw));
@@ -702,7 +702,7 @@ fn k9_cli_exports_wait_then_vertical_lift_before_curved_travel_and_keeps_air_up(
     );
     let raw = std::fs::read_to_string(&profile_path).unwrap();
     let (mut profile, _) = Profile::from_json(&raw).unwrap();
-    assert_eq!((profile.draw_speed, profile.travel_speed), (20.0, 40.0));
+    assert_eq!((profile.draw_speed, profile.travel_speed), (30.0, 40.0));
     assert_eq!((profile.k9_lift_mm, profile.liftup_delay), (Some(2.0), 30));
     assert!(!profile.k9_start_gcode.as_ref().unwrap().enabled);
     profile.k9_lift_mm = Some(2.5);
@@ -751,7 +751,7 @@ fn k9_cli_exports_wait_then_vertical_lift_before_curved_travel_and_keeps_air_up(
             .lines()
             .any(|line| line.starts_with("M20") || line == "G91")
     );
-    assert!(curve.contains(&format!("G1 X10.000 Y10.000 F1200.000\n{lift}")));
+    assert!(curve.contains(&format!("G1 X10.000 Y10.000 F1800.000\n{lift}")));
     assert!(curve.ends_with(lift));
     let between = curve.split(lift).nth(1).unwrap();
     let to_next = between.split("G1 Z1.450 F120.000\n").next().unwrap();
