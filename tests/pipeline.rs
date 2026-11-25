@@ -374,6 +374,8 @@ fn cli_k9_start_and_quadratic_travel_coexist_without_changing_draw_commands() {
         ];
         if smooth {
             args.insert(1, "--smooth-pen-up");
+        } else {
+            args.insert(1, "--straight-pen-up");
         }
         if air {
             args.insert(1, "--air-run");
@@ -412,14 +414,14 @@ fn cli_k9_start_and_quadratic_travel_coexist_without_changing_draw_commands() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    let draw = |l: &str| l.starts_with("G1 X") && l.ends_with("F600.000");
+    let draw = |l: &str| l.starts_with("G1 X") && l.ends_with("F1200.000");
     let travel = |l: &str| l.starts_with("G1 X") && l.ends_with("F2400.000");
     let z = |l: &str| l.starts_with("G1 Z");
     assert_eq!(lines(&curve, draw), lines(&straight, draw));
     assert_eq!(lines(&curve, z), lines(&straight, z));
     assert!(lines(&curve, travel).len() > lines(&straight, travel).len());
     assert_eq!(lines(&curve, travel), lines(&air, travel));
-    assert!(lines(&air, z).iter().all(|l| l.starts_with("G1 Z5.000")));
+    assert!(lines(&air, z).iter().all(|l| l.starts_with("G1 Z4.000")));
 }
 
 #[test]
@@ -681,4 +683,91 @@ fn malformed_text_metadata_is_rejected_without_loading_fonts() {
         }
         assert!(project.to_json().is_err(), "mutation {mutation}");
     }
+}
+
+#[test]
+fn k9_cli_exports_wait_then_vertical_lift_before_curved_travel_and_keeps_air_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile_path = dir.path().join("k9.json");
+    let svg_path = dir.path().join("links.svg");
+    let cli = env!("CARGO_BIN_EXE_penplot");
+    assert!(
+        Command::new(cli)
+            .arg("profile-init")
+            .arg(&profile_path)
+            .arg("--k9")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let raw = std::fs::read_to_string(&profile_path).unwrap();
+    let (mut profile, _) = Profile::from_json(&raw).unwrap();
+    assert_eq!((profile.draw_speed, profile.travel_speed), (20.0, 40.0));
+    assert_eq!((profile.k9_lift_mm, profile.liftup_delay), (Some(2.0), 30));
+    assert!(!profile.k9_start_gcode.as_ref().unwrap().enabled);
+    profile.k9_lift_mm = Some(2.5);
+    profile.pen_down_z = 1.25;
+    profile.offset_z = 0.2;
+    profile.liftup_delay = 47;
+    std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+    std::fs::write(
+        &svg_path,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="50mm" height="30mm" viewBox="0 0 50 30"><path d="M5 25 L10 20 M30 20 L35 25" fill="none" stroke="black"/></svg>"#,
+    )
+    .unwrap();
+    let export = |name: &str, optional: &[&str]| {
+        let path = dir.path().join(name);
+        let run = Command::new(cli)
+            .args([
+                "convert",
+                "--calibrated",
+                "--x",
+                "5",
+                "--y",
+                "5",
+                "--profile",
+            ])
+            .arg(&profile_path)
+            .arg("-o")
+            .arg(&path)
+            .args(optional)
+            .arg(&svg_path)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        std::fs::read_to_string(path).unwrap()
+    };
+    let curve = export("curve.gcode", &[]);
+    let straight = export("straight.gcode", &["--straight-pen-up"]);
+    let air = export("air.gcode", &["--air-run"]);
+    let lift = "G4 P47\nG1 Z3.950 F120.000\n";
+    assert!(curve.contains("G21\nG90\n"));
+    assert!(
+        !curve
+            .lines()
+            .any(|line| line.starts_with("M20") || line == "G91")
+    );
+    assert!(curve.contains(&format!("G1 X10.000 Y10.000 F1200.000\n{lift}")));
+    assert!(curve.ends_with(lift));
+    let between = curve.split(lift).nth(1).unwrap();
+    let to_next = between.split("G1 Z1.450 F120.000\n").next().unwrap();
+    assert!(
+        to_next.lines().count() > 1
+            && to_next
+                .lines()
+                .all(|l| l.starts_with("G1 X") && l.ends_with("F2400.000"))
+    );
+    assert!(to_next.ends_with("G1 X30.000 Y10.000 F2400.000\n"));
+    assert!(straight.contains(&format!("{lift}G1 X30.000 Y10.000 F2400.000\nG1 Z1.450")));
+    assert!(
+        air.lines()
+            .filter(|l| l.starts_with("G1 Z"))
+            .all(|l| l == "G1 Z3.950 F120.000")
+    );
+    profile.max_z = 3.9;
+    assert!(profile.validate().is_err());
 }

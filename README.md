@@ -29,11 +29,17 @@ SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリン�
 
 ### ペン上げ移動の平滑化（v0.7.0）
 
-**G-code Preview → PATH PLANNING → Smooth pen-up travel (quadratic)** をオンにすると、条件に合う軌跡間の空走だけを緩い二次曲線にできます。既定はオフ。描画線・Z・速度は変えません。[空走曲線の使い方と限界](docs/TRAVEL_SMOOTHING.ja.md)
+**G-code Preview → PATH PLANNING → Smooth pen-up travel (quadratic)** をオンにすると、条件に合う軌跡間の空走だけを緩い二次曲線にできます。既定はオフ（v0.9.0 から新規 K9 プリセットではオン）。描画線・Z・速度は変えません。[空走曲線の使い方と限界](docs/TRAVEL_SMOOTHING.ja.md)
 
 ### K9 の開始 G-code（v0.8.0）
 
 **G-code Preview → MACHINE PROFILE → EasyThreed K9 → START G-CODE** で、`M203 X100 Y100`・`M201 X200 Y200`・`M204 P100 T200` を初期値として編集できます。対応する設定命令は純正 AT32 の公開ダンプで確認しましたが、実機の安全性は未確認のため**出力は既定でオフ**。移動指令や EEPROM は変更しません。[設定方法と注意](docs/K9.md#開始-g-codek9-の実験設定)
+
+### K9 の高速寄りプリセット（v0.9.0）
+
+新規 **EasyThreed K9** プリセットは描画 20 mm/s・空走 40 mm/s。各ストロークの最後（最後の1本を含む）で **Before pen up (ms)** の待機（既定 30 ms）を入れ、XY を動かさず **Vertical lift (mm)** の分だけ Z を上げます（既定 2.0 mm、G90 の絶対座標で出力）。その高さを保って次の描画位置へ移動し、空走は可能な区間で二次曲線を使います。短距離・境界近くなどは直線に戻ります。
+
+保存済みの従来プロジェクトは自動変更しません。機械設定で垂直上昇指定をオンにすれば、測定済みの Draw Z を残したまま試せます。CLI ではプロファイルの `k9_lift_mm` と `liftup_delay` を調整し、`--straight-pen-up` で曲線を解除できます。実測した Z・可動域で先にペンを外して空走してください。設定値は指令速度であって実測速度ではありません。実験用 M コードは引き続き既定オフです。
 
 ### ソースからビルド
 

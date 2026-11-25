@@ -32,7 +32,7 @@ impl CommandPreview {
             add_x += bed.x * 0.5;
             add_y += bed.y * 0.5;
         }
-        let up = ((profile.pen_up_z + profile.offset_z) * 1000.0).round() / 1000.0;
+        let up = (profile.clearance_z() * 1000.0).round() / 1000.0;
         let xy_count = gcode
             .lines()
             .filter(|line| line.starts_with("G1 X"))

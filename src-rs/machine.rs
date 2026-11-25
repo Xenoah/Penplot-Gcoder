@@ -160,6 +160,9 @@ pub struct Profile {
     pub pen_down_speed: f64,
     pub touchdown_delay: u32,
     pub liftup_delay: u32,
+    /// K9-only lift above Draw Z, emitted as an absolute Z target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k9_lift_mm: Option<f64>,
     /// Presence marks the explicit K9 planner-preamble option, including while disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k9_start_gcode: Option<K9StartGcode>,
@@ -186,6 +189,7 @@ impl Default for Profile {
             pen_down_speed: 2.0,
             touchdown_delay: 0,
             liftup_delay: 0,
+            k9_lift_mm: None,
             k9_start_gcode: None,
         }
     }
@@ -210,6 +214,9 @@ impl Profile {
             name: Self::K9_NAME.to_owned(),
             k9_start_gcode: Some(K9StartGcode::default()),
             travel_speed: 40.0,
+            draw_speed: 20.0,
+            liftup_delay: 30,
+            k9_lift_mm: Some(2.0),
             ..Self::default()
         }
     }
@@ -228,6 +235,13 @@ impl Profile {
             pen_down_z: 0.0,
             ..Self::default()
         }
+    }
+
+    /// Effective clearance, expressed from machine zero including its common offset.
+    pub fn clearance_z(&self) -> f64 {
+        self.k9_lift_mm
+            .map_or(self.pen_up_z, |lift| self.pen_down_z + lift)
+            + self.offset_z
     }
 
     fn has_unmeasured_z(&self) -> bool {
@@ -282,8 +296,9 @@ impl Profile {
         let mut profile = if name.eq_ignore_ascii_case("k9") {
             Self {
                 // Keep old profile migration defaults; only the explicit Rust K9 preset is faster.
-                travel_speed: Self::default().travel_speed,
-                ..Self::k9()
+                name: Self::K9_NAME.to_owned(),
+                k9_start_gcode: Some(K9StartGcode::default()),
+                ..Self::default()
             }
         } else {
             Self {
@@ -399,6 +414,14 @@ impl Profile {
             }
             start.commands()?;
         }
+        if let Some(lift) = self.k9_lift_mm {
+            if self.machine_preset.is_some() || self.k9_start_gcode.is_none() {
+                return Err("Relative lift requires the EasyThreed K9 profile".into());
+            }
+            if !(0.001..=self.max_z).contains(&lift) {
+                return Err("K9 lift must be positive and within the Z limit".into());
+            }
+        }
         if !self.offset_x.is_finite() || !self.offset_y.is_finite() {
             return Err("XY offsets must be finite".into());
         }
@@ -412,10 +435,7 @@ impl Profile {
         if self.has_unmeasured_z() {
             return Ok(()); // Valid as a saved profile/layout; not as machine output.
         }
-        let (up, down) = (
-            self.pen_up_z + self.offset_z,
-            self.pen_down_z + self.offset_z,
-        );
+        let (up, down) = (self.clearance_z(), self.pen_down_z + self.offset_z);
         for z in [up, down] {
             if !(0.0..=self.max_z).contains(&z) || !(0.0..=self.max_z).contains(&rounded(z)) {
                 return Err("Commanded Z heights, including offset and rounding, must be within the Z limits".into());
@@ -576,7 +596,7 @@ pub fn generate_with_travel(
     } else {
         0
     };
-    let up = rounded(profile.pen_up_z + profile.offset_z);
+    let up = rounded(profile.clearance_z());
     let down = rounded(profile.pen_down_z + profile.offset_z);
     let mut result = Output {
         gcode: if air_run {
@@ -764,7 +784,7 @@ mod tests {
             air_other
                 .iter()
                 .filter(|line| line.starts_with("G1 Z"))
-                .all(|line| line.starts_with("G1 Z5.000 "))
+                .all(|line| line.starts_with("G1 Z4.000 "))
         );
         assert_eq!(&curve_xy[..2], &straight_xy[..2]);
         assert_eq!(
@@ -773,7 +793,7 @@ mod tests {
         );
         let up = curve
             .gcode
-            .split("G4 P31\nG1 Z5.000 F120.000\n")
+            .split("G4 P31\nG1 Z4.000 F120.000\n")
             .nth(1)
             .unwrap()
             .split("G1 Z2.000 ")
@@ -819,6 +839,7 @@ mod tests {
     fn native_prior_k9_profiles_gain_the_off_editor_without_changing_output() {
         let mut json = serde_json::to_value(Profile::k9()).unwrap();
         json.as_object_mut().unwrap().remove("k9_start_gcode");
+        json.as_object_mut().unwrap().remove("k9_lift_mm");
         json["travel_speed"] = 36.0.into();
         json["pen_up_z"] = 7.15.into();
         let old: Profile = serde_json::from_value(json.clone()).unwrap();
@@ -1039,7 +1060,7 @@ mod tests {
         let default = Profile::default();
         let k9 = Profile::k9();
         assert_eq!(k9.travel_speed, 40.0);
-        assert_eq!(k9.draw_speed, default.draw_speed);
+        assert_eq!(k9.draw_speed, 20.0);
         assert_eq!(k9.pen_up_speed, default.pen_up_speed);
         assert_eq!(k9.pen_down_speed, default.pen_down_speed);
         let (legacy, _) = Profile::from_json(include_str!("../profiles/printers/K9.json")).unwrap();
@@ -1048,7 +1069,7 @@ mod tests {
         assert_eq!(native.travel_speed, default.travel_speed);
         let output = generate(&[stroke(&[(10.0, 10.0), (20.0, 10.0)], false)], &k9).unwrap();
         assert!(output.gcode.contains("G1 X10.000 Y10.000 F2400.000"));
-        assert!(output.gcode.contains("G1 X20.000 Y10.000 F600.000"));
+        assert!(output.gcode.contains("G1 X20.000 Y10.000 F1200.000"));
     }
 
     #[test]

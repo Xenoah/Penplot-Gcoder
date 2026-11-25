@@ -1229,7 +1229,32 @@ impl Studio {
             "Draw and clearance are absolute targets from the same active Z=0 after homing, not a lift distance. The common offset adds to both."
         });
         changed |= number(ui, "Draw Z (mm)", &mut profile.pen_down_z, 0.1);
-        changed |= number(ui, "Clearance Z (mm)", &mut profile.pen_up_z, 0.1);
+        if profile.k9_start_gcode.is_some() {
+            let mut relative = profile.k9_lift_mm.is_some();
+            if ui
+                .checkbox(
+                    &mut relative,
+                    if self.japanese {
+                        "描画 Z からの垂直上昇量を指定"
+                    } else {
+                        "Set vertical lift above Draw Z"
+                    },
+                )
+                .changed()
+            {
+                profile.k9_lift_mm = relative.then_some(2.0);
+                changed = true;
+            }
+        }
+        if let Some(lift) = &mut profile.k9_lift_mm {
+            changed |= number(ui, "Vertical lift (mm)", lift, 0.1);
+            ui.small(format!(
+                "Clearance Z = {:.3} mm (absolute)",
+                profile.clearance_z()
+            ));
+        } else {
+            changed |= number(ui, "Clearance Z (mm)", &mut profile.pen_up_z, 0.1);
+        }
         changed |= number(ui, "Common Z offset (mm)", &mut profile.offset_z, 0.1);
         ui.separator();
         section(ui, "PEN & SPEED");
@@ -1328,6 +1353,8 @@ impl Studio {
             self.air_first = true;
             self.status = preset.notice().into();
         } else {
+            self.air_first = true;
+            self.options.smooth_pen_up = true;
             self.status = "Loaded K9 starting values. Measure your machine before export.".into();
         }
         self.invalidate();
@@ -2092,7 +2119,7 @@ impl Studio {
         painter.rect_filled(base, 7.0, Color32::from_rgb(15, 21, 27));
         let bed_x = self.profile.bed_x;
         let bed_y = self.profile.bed_y;
-        let up = self.profile.pen_up_z + self.profile.offset_z;
+        let up = self.profile.clearance_z();
         let down = self.profile.pen_down_z + self.profile.offset_z;
         let Some(map) = IsoMap::fit(
             base.shrink2(egui::vec2(32.0, 55.0)),

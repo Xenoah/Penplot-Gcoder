@@ -23,7 +23,8 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --spacing MM         hatch spacing (default 1); --angle DEG (default 45)
   --min-image-stroke MM omit raster strokes shorter than MM after placement (0 = off)
   --optimize           reduce lifts' travel within contiguous layer runs
-  --smooth-pen-up      opt in to quadratic smoothing of eligible pen-up links
+  --smooth-pen-up      use quadratic smoothing of eligible pen-up links
+  --straight-pen-up    disable smoothing (default except new K9 profiles)
   --dpi N              PNG/JPEG physical scale (default 96)
   --threshold 0..255   raster foreground brightness cutoff (default 128)
   --invert             select bright instead of dark pixels
@@ -38,6 +39,8 @@ No machine access, homing, extrusion, heating or motor disable commands.
 P1S is layout-only. Aries output is experimental and requires measured Z values.
 In profile JSON, pen_down_z (Draw Z) and pen_up_z (Clearance Z) are separate
 absolute heights in mm from the same active/homed Z origin; offset_z adds to both.
+An optional K9 k9_lift_mm overrides Clearance Z with Draw Z + lift.
+liftup_delay is the wait in ms before the vertical lift.
 The K9 profile pre-fills k9_start_gcode.code; set k9_start_gcode.enabled to
 true only to test the experimental M203 X/Y, M201 X/Y and M204 P/T preamble.
 This does not change commanded feeds or save EEPROM, and affects air runs too.
@@ -119,6 +122,7 @@ fn run(mut it: Args) -> Result<(), String> {
     let mut files = Vec::new();
     let mut supplied_job_settings = false;
     let mut minimum = None;
+    let mut smoothing = None;
     while let Some(arg) = it.next() {
         let flag = arg.to_str().unwrap_or("");
         if flag.starts_with('-')
@@ -165,7 +169,8 @@ fn run(mut it: Args) -> Result<(), String> {
             "--rotate" => opts.rotation_deg = num(&mut it, "--rotate")?,
             "--min-image-stroke" => minimum = Some(num(&mut it, "--min-image-stroke")?),
             "--optimize" => opts.optimize = true,
-            "--smooth-pen-up" => opts.smooth_pen_up = true,
+            "--smooth-pen-up" => smoothing = Some(true),
+            "--straight-pen-up" => smoothing = Some(false),
             "--hatch" => {
                 opts.fill = match value(&mut it, "--hatch")?.to_str() {
                     Some("lines") => Fill::Lines,
@@ -253,6 +258,9 @@ fn run(mut it: Args) -> Result<(), String> {
             .transpose()?
             .unwrap_or_default()
     };
+    if !is_project {
+        opts.smooth_pen_up = smoothing.unwrap_or(p.k9_lift_mm.is_some());
+    }
     if let Some(m) = margin {
         penplot::fit(&strokes, &p, &mut opts, m)?;
     }
