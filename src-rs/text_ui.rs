@@ -566,6 +566,29 @@ mod tests {
     }
 
     #[test]
+    fn resized_text_keeps_its_paper_size_and_position_when_reedited() {
+        let mut app = Studio::default();
+        let draft = prepare(&app, None, "O");
+        app.apply_text(&draft).unwrap();
+        app.transform_layer(0, PlacementMotion::Scale(Point::new(5., 5.), 1.5))
+            .unwrap();
+        let resized = app.layers[0].text.as_ref().unwrap();
+        let physical = compose(app.text_world_transform(), resized.transform);
+        let edit = prepare(&app, Some(0), "OO");
+        assert!((edit.em_mm - 15.).abs() < 1e-8);
+        assert!((edit.x - physical[4]).abs() < 1e-8);
+        assert!((edit.y - physical[5]).abs() < 1e-8);
+        app.apply_text(&edit).unwrap();
+        let updated = app.layers[0].text.as_ref().unwrap();
+        let after = compose(app.text_world_transform(), updated.transform);
+        assert!((updated.em_mm * after[0].hypot(after[1]) - 15.).abs() < 1e-8);
+        near(
+            Point::new(physical[4], physical[5]),
+            Point::new(after[4], after[5]),
+        );
+    }
+
+    #[test]
     fn text_is_a_separate_object_with_saved_holes_and_delete_undo_redo() {
         let mut app = Studio::default();
         let draft = prepare(&app, None, "fi 日本語\nO");

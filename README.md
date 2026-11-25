@@ -7,8 +7,8 @@ SVG・DXF・画像を読み込み、文字や手描きを加え、3D プリン�
 ## まず試す（実機なし）
 
 1. Windows x64 ビルドの `penplot-studio.exe` を起動。ソースからは下記 `cargo run`。同梱の `examples/alignment-card.svg` を画面にドロップする。
-2. 2D の **Move / Scale** は同じモードで、枠内をドラッグして移動、角をドラッグして縦横比を保って拡大・縮小。表示中の全レイヤーに作用する。回転は **Rotate** の丸いハンドルをドラッグ。Shift で移動を軸に固定・回転を 15° 刻みにし、Esc で操作を取り消せる。**Edit** の左側で配置値を、右側でレイヤー順を編集できる。**G-code Preview** の左側の **PATH PLANNING** で輪郭だけ／平行ハッチ／クロスハッチを比較する。実線が描画。ペン上げ移動の破線は タイムラインの Show travel で表示する（初期状態は非表示）。タイムラインでストローク順を追える。**3D lifts** は機械設定の上下 Z とストローク間のリフトを固定視点で立体表示し、Z は 1〜12 倍に誇張できる（[画面例](docs/studio-lifts.png)）。実機の干渉判定ではない。
-3. 外枠は原寸 40 × 24 mm。**Fit** は余白を残して拡縮するので、原寸のまま使うなら Scale = 1。図形は回転→拡縮し、回転後外接枠の左下を紙面 X/Y に合わせる。
+2. 2D の **Move / Scale** では、レイヤーを選んで枠内をドラッグすると移動、角をドラッグすると縦横比を保って拡大・縮小。**Rotate** の丸いハンドルも選択レイヤーだけに作用する。Shift で移動を軸に固定・回転を 15° 刻みにし、Esc で操作を取り消せる。**Edit** の左側で選択レイヤーの幅・高さ・位置を数値で調整できる。**G-code Preview** の左側の **PATH PLANNING** で輪郭だけ／平行ハッチ／クロスハッチを比較する。実線が描画。ペン上げ移動の破線はタイムラインの Show travel で表示する（初期状態は非表示）。**3D lifts** ではストローク間のリフトを立体表示し、Z は 1〜12 倍に誇張できる（[画面例](docs/studio-lifts.png)）。実機の干渉判定ではない。
+3. 外枠は原寸 40 × 24 mm。**Fit to usable bed** は全表示レイヤーをまとめて拡縮する操作なので、原寸で使うなら押さない。
 4. ファイルを実機で使う段階で、**G-code Preview → MACHINE PROFILE** に接触・退避 Z、送り、実際の可動範囲と取付補正を入力する。先に **Export air run…** で全経路ペン上げの空走ファイルを出力する。[K9 の実測・手動 HOME・初回テスト](docs/K9.md) / [P1S・Aries の機種プリセットと絶対 Z](docs/MACHINE-PRESETS.md)
 
 書き出し後は、保存した G-code の丸め済みコマンドから作った 2D プレビューを **G-code Preview** タブで表示します。編集中のルートとは独立したスナップショットで、通常描画のペン上げ移動は表示を切り替えられます。画面下部の概算時間は通常／空走を併記し、加減速・初期移動・ファームウェアの処理時間を含みません。
@@ -131,3 +131,5 @@ Rust の入口は `src-rs/lib.rs`（変換）、`src-rs/desktop.rs`（GUI）、`
 ### Selecting and deleting objects
 
 Click a line in Pan, Move / Scale or Rotate to select its object, or select a row in the Layers list. Imported SVG/DXF/images are selected as whole layers; a canvas mark is selected as one continuous stroke. A layer row always targets that whole layer. Delete or the scoped right-click menu removes the selected object, and Ctrl+Z restores it (Ctrl+Y / Ctrl+Shift+Z redo). Right-clicking blank canvas clears the selection. Text/number editing, dialogs, import work and active drags keep their own keys. Deleting an object preserves the placement of the remaining artwork and invalidates generated output until replanning finishes.
+
+**Move / Scale** and **Rotate** transform only the selected layer, including when a mark on that layer is selected. Drag a corner to resize about the opposite corner, or enter Width or Height in mm to resize proportionally from the lower-left. Only the explicit **Fit to usable bed** operation fits all visible layers together.

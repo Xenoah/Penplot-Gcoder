@@ -80,8 +80,8 @@ impl Studio {
                             ui.separator();
                             section(ui, "TOOL OPTIONS");
                             ui.small(match self.tools {
-                                Tool::Transform => "Drag inside to move; corners scale. Shift locks the axis.",
-                                Tool::Rotate => "Drag the round handle. Shift snaps to 15°.",
+                                Tool::Transform => "Select a layer. Drag inside to move it, or drag a corner to scale it.",
+                                Tool::Rotate => "Drag the selected layer’s round handle. Shift snaps to 15°.",
                                 Tool::Pan => "Drag to pan. Scroll to zoom. Click a path to select.",
                                 _ => "Drag on the bed to draw. Escape cancels the current stroke.",
                             });
@@ -368,7 +368,8 @@ mod tests {
                     } else {
                         PlacementHandle::Move
                     },
-                    before: original.clone(),
+                    layer: 0,
+                    revision,
                     motion: if scale {
                         PlacementMotion::Scale(bounds[2], 1.5)
                     } else {

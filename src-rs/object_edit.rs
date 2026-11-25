@@ -873,7 +873,8 @@ mod tests {
             bounds,
             cursor_start: bounds[0],
             handle: PlacementHandle::Move,
-            before: app.options.clone(),
+            layer: 0,
+            revision: app.revision,
             motion: PlacementMotion::Move(Point::new(1., 2.)),
         });
         assert!(!app.can_export());

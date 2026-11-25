@@ -146,7 +146,7 @@ struct Studio {
     planned: Vec<Stroke>,
     output: Option<Arc<Output>>,
     placement_drag: Option<PlacementDrag>,
-    placement_bounds_cache: Option<(u64, Option<[Point; 4]>)>,
+    placement_bounds_cache: Option<(u64, usize, Option<[Point; 4]>)>,
     show_travel: bool,
     play: bool,
     shown: usize,
@@ -1099,33 +1099,51 @@ impl Studio {
     }
 
     fn placement_panel(&mut self, ui: &mut egui::Ui) {
-        section(ui, "PLACEMENT · MM");
-        let mut draft = self.options.clone();
-        let mut changed = number(ui, "Scale factor", &mut draft.scale, 0.01);
-        changed |= number(ui, "Rotation (deg)", &mut draft.rotation_deg, 0.5);
-        changed |= number(ui, "Left X", &mut draft.x, 0.1);
-        changed |= number(ui, "Bottom Y", &mut draft.y, 0.1);
+        section(ui, "SELECTED LAYER · MM");
+        if self.placement_drag.is_some() {
+            ui.small("Finish or cancel the canvas drag to edit numeric placement.");
+        } else if let (Some(layer), Some(bounds)) =
+            (self.placement_layer(), self.placement_bounds())
+        {
+            let low = bounds[0];
+            let (old_width, old_height) = (bounds[2].x - low.x, bounds[2].y - low.y);
+            let (mut width, mut height, mut x, mut y) = (old_width, old_height, low.x, low.y);
+            let width_changed = ui
+                .add_enabled_ui(old_width > 1e-8, |ui| number(ui, "Width", &mut width, 0.1))
+                .inner;
+            let height_changed = ui
+                .add_enabled_ui(old_height > 1e-8, |ui| {
+                    number(ui, "Height", &mut height, 0.1)
+                })
+                .inner;
+            let moved = number(ui, "Left X", &mut x, 0.1) | number(ui, "Bottom Y", &mut y, 0.1);
+            let motion = if width_changed {
+                Some(PlacementMotion::Scale(low, width / old_width))
+            } else if height_changed {
+                Some(PlacementMotion::Scale(low, height / old_height))
+            } else if moved {
+                Some(PlacementMotion::Move(Point::new(x - low.x, y - low.y)))
+            } else {
+                None
+            };
+            if let Some(motion) = motion {
+                self.finish_layer_placement(layer, motion, ui.ctx());
+            }
+            ui.small("Width and height keep the aspect ratio.");
+        } else {
+            ui.small("Select a visible layer or click its path to transform it.");
+        }
+        ui.separator();
+        section(ui, "WHOLE JOB");
         if ui
             .add_enabled(
-                self.layers.iter().any(|layer| layer.visible),
+                self.placement_drag.is_none() && self.layers.iter().any(|layer| layer.visible),
                 egui::Button::new("Fit to usable bed"),
             )
             .on_hover_text("Fit the combined visible artwork with a 5 mm border.")
             .clicked()
         {
-            match self.fit_artwork(&mut draft) {
-                Ok(()) => {
-                    changed = true;
-                    self.frame = Camera::default();
-                    self.status = "Artwork fitted to the usable bed.".into();
-                }
-                Err(error) => self.status = error,
-            }
-        }
-        if changed {
-            self.record_layers();
-            self.options = draft;
-            self.invalidate();
+            self.fit_and_reset_view();
             ui.ctx().request_repaint();
         }
     }
@@ -1707,11 +1725,20 @@ struct PlacementDrag {
     bounds: [Point; 4],
     cursor_start: Point,
     handle: PlacementHandle,
-    before: JobOptions,
+    layer: usize,
+    revision: u64,
     motion: PlacementMotion,
 }
 
 impl PlacementDrag {
+    fn affects(&self, stroke: &Stroke) -> bool {
+        stroke
+            .layer
+            .split_once(':')
+            .and_then(|(prefix, _)| prefix.parse::<usize>().ok())
+            == Some(self.layer)
+    }
+
     fn update(&mut self, cursor: Point, snap: bool) {
         let delta = Point::new(
             cursor.x - self.cursor_start.x,
@@ -1733,8 +1760,7 @@ impl PlacementDrag {
                     return;
                 }
                 let factor = 1.0 + (delta.x * x + delta.y * y) / denominator;
-                let min = 1e-8_f64.min(self.before.scale) / self.before.scale;
-                PlacementMotion::Scale(pivot, factor.clamp(min, 1e8 / self.before.scale))
+                PlacementMotion::Scale(pivot, factor.clamp(1e-8, 1e8))
             }
             PlacementHandle::Rotate(pivot) => {
                 let angle = |p: Point| (p.y - pivot.y).atan2(p.x - pivot.x);
@@ -1747,39 +1773,6 @@ impl PlacementDrag {
                 PlacementMotion::Rotate(pivot, degrees)
             }
         };
-    }
-
-    fn options(self, layers: &[Layer]) -> Option<JobOptions> {
-        let mut opts = self.before;
-        let left_bottom = Point::new(opts.x, opts.y);
-        match self.motion {
-            PlacementMotion::Move(_) => {
-                let p = self.motion.apply(left_bottom);
-                opts.x = p.x;
-                opts.y = p.y;
-            }
-            PlacementMotion::Scale(_, factor) => {
-                let p = self.motion.apply(left_bottom);
-                opts.x = p.x;
-                opts.y = p.y;
-                opts.scale *= factor;
-            }
-            PlacementMotion::Rotate(_, degrees) => {
-                let (old_sin, old_cos) = opts.rotation_deg.rem_euclid(360.0).to_radians().sin_cos();
-                let raw_lo = projected_min(layers, opts.scale, old_sin, old_cos)?;
-                let raw_origin = Point::new(opts.x - raw_lo.x, opts.y - raw_lo.y);
-                let rotated_origin = self.motion.apply(raw_origin);
-                opts.rotation_deg = (opts.rotation_deg + degrees).rem_euclid(360.0);
-                let (sin, cos) = opts.rotation_deg.to_radians().sin_cos();
-                let new_lo = projected_min(layers, opts.scale, sin, cos)?;
-                opts.x = rotated_origin.x + new_lo.x;
-                opts.y = rotated_origin.y + new_lo.y;
-            }
-        }
-        [opts.x, opts.y, opts.scale, opts.rotation_deg]
-            .into_iter()
-            .all(f64::is_finite)
-            .then_some(opts)
     }
 }
 
@@ -1857,9 +1850,19 @@ fn placement_handle(
 }
 
 impl Studio {
+    fn placement_layer(&self) -> Option<usize> {
+        let index = self.selected?.layer();
+        self.layers
+            .get(index)
+            .filter(|layer| layer.visible && !layer.strokes.is_empty())
+            .map(|_| index)
+    }
+
     fn placement_bounds(&mut self) -> Option<[Point; 4]> {
-        if let Some((revision, result)) = self.placement_bounds_cache
+        let index = self.placement_layer()?;
+        if let Some((revision, cached_layer, result)) = self.placement_bounds_cache
             && revision == self.revision
+            && cached_layer == index
         {
             return result;
         }
@@ -1870,9 +1873,10 @@ impl Studio {
                 .into_iter()
                 .all(|value| value.is_finite() && value.abs() <= 1e8)
         {
-            projected_bounds(&self.layers, opts.scale, sin, cos).and_then(|(lo, hi)| {
-                let (left, bottom) = (opts.x, opts.y);
-                let (right, top) = (left + hi.x - lo.x, bottom + hi.y - lo.y);
+            projected_min(&self.layers, opts.scale, sin, cos).and_then(|all| {
+                let (lo, hi) = projected_bounds(&self.layers[index..=index], opts.scale, sin, cos)?;
+                let (dx, dy) = (opts.x - all.x, opts.y - all.y);
+                let (left, bottom, right, top) = (lo.x + dx, lo.y + dy, hi.x + dx, hi.y + dy);
                 (right.is_finite() && top.is_finite()).then_some([
                     Point::new(left, bottom),
                     Point::new(right, bottom),
@@ -1883,8 +1887,98 @@ impl Studio {
         } else {
             None
         };
-        self.placement_bounds_cache = Some((self.revision, result));
+        self.placement_bounds_cache = Some((self.revision, index, result));
         result
+    }
+
+    fn transform_layer(&mut self, index: usize, motion: PlacementMotion) -> Result<(), String> {
+        let error = || "Invalid layer transform or placement.".to_owned();
+        if motion.identity() {
+            return Ok(());
+        }
+        if self.placement_layer() != Some(index) {
+            return Err(error());
+        }
+        let valid = |p: Point| [p.x, p.y].into_iter().all(|v| (-1e8..=1e8).contains(&v));
+        let scale = self.options.scale;
+        if !(0.0..=1e8).contains(&scale) || scale == 0.0 {
+            return Err(error());
+        }
+        let (sin, cos) = self
+            .options
+            .rotation_deg
+            .rem_euclid(360.0)
+            .to_radians()
+            .sin_cos();
+        let old_min = projected_min(&self.layers, scale, sin, cos).ok_or_else(error)?;
+        let shift = Point::new(self.options.x - old_min.x, self.options.y - old_min.y);
+        let origin = motion.apply(shift);
+        let (x, y) = ((origin.x - shift.x) / scale, (origin.y - shift.y) / scale);
+        let offset = Point::new(x * cos + y * sin, -x * sin + y * cos);
+        // Uniform scales and rotations commute in 2D. Only the shift needs conjugation.
+        let linear = match motion {
+            PlacementMotion::Move(_) => (1.0, 0.0),
+            PlacementMotion::Scale(_, factor) if (1e-8..=1e8).contains(&factor) => (factor, 0.0),
+            PlacementMotion::Scale(..) => return Err(error()),
+            PlacementMotion::Rotate(_, degrees) => {
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                (cos, sin)
+            }
+        };
+        let direction = |p: Point| {
+            let (c, s) = linear;
+            Point::new(c * p.x - s * p.y, s * p.x + c * p.y)
+        };
+        let map = |p| {
+            let p = direction(p);
+            Point::new(p.x + offset.x, p.y + offset.y)
+        };
+        let mut edited = self.layers[index].clone();
+        let mut strokes = edited.strokes.to_vec();
+        for point in strokes.iter_mut().flat_map(|stroke| &mut stroke.points) {
+            *point = map(*point);
+            if !valid(*point) {
+                return Err(error());
+            }
+        }
+        edited.strokes = strokes.into();
+        if let Some(text) = &mut edited.text {
+            let [a, b, c, d, x, y] = text.transform;
+            let (u, v, p) = (
+                direction(Point::new(a, b)),
+                direction(Point::new(c, d)),
+                map(Point::new(x, y)),
+            );
+            text.transform = [u.x, u.y, v.x, v.y, p.x, p.y];
+            text.validate()?;
+        }
+        let mut candidate = self.layers.clone();
+        candidate[index] = edited;
+        let new_min = projected_min(&candidate, scale, sin, cos).ok_or_else(error)?;
+        // The planner normalizes to the visible artwork's min before placing.
+        // Rebase that anchor so the unedited layers stay on the same paper coordinates.
+        let anchor = Point::new(shift.x + new_min.x, shift.y + new_min.y);
+        if !valid(anchor) {
+            return Err(error());
+        }
+        self.record_layers();
+        self.layers = candidate;
+        self.options.x = anchor.x;
+        self.options.y = anchor.y;
+        self.invalidate();
+        Ok(())
+    }
+
+    fn finish_layer_placement(
+        &mut self,
+        index: usize,
+        motion: PlacementMotion,
+        ctx: &egui::Context,
+    ) {
+        if let Err(error) = self.transform_layer(index, motion) {
+            self.status = error;
+        }
+        ctx.request_repaint();
     }
 
     fn handle_placement(&mut self, ui: &egui::Ui, response: &egui::Response, map: CanvasMap) {
@@ -1893,7 +1987,10 @@ impl Studio {
             && response.drag_started_by(primary)
             && self.import_task.is_none()
             && self.import_dialog.is_none()
+            && !self.preview_dirty
+            && self.plan_task.is_none()
             && let Some(press) = ui.input(|input| input.pointer.press_origin())
+            && let Some(layer) = self.placement_layer()
             && let Some(bounds) = self.placement_bounds()
         {
             let handle = placement_handle(self.tools, press, bounds.map(|p| map.screen(p)), bounds);
@@ -1904,7 +2001,8 @@ impl Studio {
                     bounds,
                     cursor_start: map.paper(press),
                     handle,
-                    before: self.options.clone(),
+                    layer,
+                    revision: self.revision,
                     motion: PlacementMotion::Move(Point::new(0.0, 0.0)),
                 });
             }
@@ -1916,13 +2014,9 @@ impl Studio {
         }
         if response.drag_stopped_by(primary)
             && let Some(drag) = self.placement_drag.take()
-            && !drag.motion.identity()
-            && let Some(opts) = drag.options(&self.layers)
+            && self.revision == drag.revision
         {
-            self.record_layers();
-            self.options = opts;
-            self.invalidate();
-            ui.ctx().request_repaint();
+            self.finish_layer_placement(drag.layer, drag.motion, ui.ctx());
         }
         if !ui.input(|input| input.pointer.button_down(primary)) {
             self.placement_drag = None;
@@ -1965,10 +2059,10 @@ impl Studio {
             }
             let hint = match self.tools {
                 Tool::Transform if self.japanese => {
-                    "内側をドラッグで移動 · 角で拡大縮小 · Shiftで軸固定 · Escで取消"
+                    "選択レイヤー：内側で移動 · 角で拡大縮小 · Shiftで軸固定 · Escで取消"
                 }
                 Tool::Transform => {
-                    "Drag inside to move · corners resize · Shift: one axis · Esc: cancel"
+                    "Selected layer: drag inside to move · corners resize · Shift: one axis · Esc: cancel"
                 }
                 Tool::Rotate => "Drag the circular handle · Shift: 15° steps · Esc: cancel",
                 _ => "Wheel: zoom · Middle drag: pan",
@@ -2076,7 +2170,7 @@ impl Studio {
         if self.tools.placement() {
             self.handle_placement(ui, &response, map);
             if let Some(drag) = &self.placement_drag {
-                self.paint_route_transformed(&painter, map, |point| drag.motion.apply(point));
+                self.paint_route_transformed(&painter, map, Some(drag));
                 draw_placement_handles(
                     &painter,
                     map,
@@ -2272,14 +2366,14 @@ impl Studio {
     }
 
     fn paint_route(&self, painter: &egui::Painter, map: CanvasMap) {
-        self.paint_route_transformed(painter, map, |point| point);
+        self.paint_route_transformed(painter, map, None);
     }
 
     fn paint_route_transformed(
         &self,
         painter: &egui::Painter,
         map: CanvasMap,
-        transform: impl Fn(Point) -> Point,
+        drag: Option<&PlacementDrag>,
     ) {
         let mut previous = None;
         let clipped = painter.clip_rect().expand(2.0);
@@ -2292,10 +2386,15 @@ impl Studio {
             let Some(&first) = stroke.points.first() else {
                 continue;
             };
+            let motion = drag
+                .filter(|drag| drag.affects(stroke))
+                .map(|drag| drag.motion);
+            let transform = |point| motion.map_or(point, |motion| motion.apply(point));
             let start = map.screen(transform(first));
             let active = index < self.shown;
             if active
                 && self.show_travel
+                && drag.is_none()
                 && let Some(last) = previous
             {
                 let ink = Ink::new(1.2, Color32::from_rgb(209, 114, 59));
@@ -2921,14 +3020,15 @@ mod tests {
             bounds,
             cursor_start: Point::new(22.5, 25.0),
             handle: PlacementHandle::Rotate(pivot),
-            before: app.options.clone(),
+            layer: 0,
+            revision: app.revision,
             motion: PlacementMotion::Rotate(pivot, 0.0),
         };
         drag.update(Point::new(14.5, 22.0), true);
         let intended: Vec<_> = before.into_iter().map(|p| drag.motion.apply(p)).collect();
-        app.options = drag.options(&app.layers).unwrap();
-        assert_eq!(app.options.rotation_deg, 45.0);
-        app.invalidate();
+        assert!(matches!(drag.motion, PlacementMotion::Rotate(_, 45.0)));
+        app.transform_layer(drag.layer, drag.motion).unwrap();
+        assert_eq!(app.options.rotation_deg, 0.0);
         app.rebuild();
         for (point, expected) in app.planned[0].points.iter().zip(intended) {
             assert!((point.x - expected.x).hypot(point.y - expected.y) < 1e-8);
@@ -2968,20 +3068,16 @@ mod tests {
             bounds: [pivot; 4],
             cursor_start: Point::new(30.0, 30.0),
             handle: PlacementHandle::Scale(pivot),
-            before: JobOptions {
-                x: 20.0,
-                y: 20.0,
-                ..JobOptions::default()
-            },
+            layer: 0,
+            revision: 0,
             motion: PlacementMotion::Scale(pivot, 1.0),
         };
         drag.update(Point::new(40.0, 40.0), false);
         assert_eq!(drag.motion.apply(pivot), pivot);
         assert_eq!(drag.motion.apply(drag.cursor_start), Point::new(40.0, 40.0));
         drag.update(Point::new(5.0, 5.0), false);
-        let opts = drag.options(&[]).unwrap();
-        assert!(opts.scale > 0.0);
-        assert_eq!((opts.x, opts.y), (20.0, 20.0));
+        assert!(matches!(drag.motion, PlacementMotion::Scale(_, f) if f > 0.0));
+        assert_eq!(drag.motion.apply(pivot), pivot);
     }
 
     #[test]
@@ -2999,7 +3095,8 @@ mod tests {
             bounds,
             cursor_start: bounds[0],
             handle: PlacementHandle::Move,
-            before: original.clone(),
+            layer: 0,
+            revision,
             motion: PlacementMotion::Move(Point::new(0.0, 0.0)),
         };
         drag.update(Point::new(bounds[0].x + 3.0, bounds[0].y + 5.0), true);
@@ -3095,6 +3192,150 @@ mod tests {
         assert_eq!((app.options.x, app.options.y), (30.0, 30.0));
         app.redo();
         assert_eq!(app.options.x, moved_x);
+    }
+
+    #[test]
+    fn resize_one_layer_by_drag_leaves_other_layer_and_its_gcode_fixed() {
+        let ctx = egui::Context::default();
+        let mut app = Studio {
+            profile: Profile::k9(),
+            ..Studio::default()
+        };
+        app.options.optimize = false;
+        app.add_mark(vec![Point::new(30., 30.), Point::new(50., 50.)], false)
+            .unwrap();
+        let mut other = app.layers[0].clone();
+        other.name = "Other layer".into();
+        let mut strokes = other.strokes.to_vec();
+        strokes[0].points = vec![Point::new(70., 65.), Point::new(86., 72.)];
+        other.strokes = strokes.into();
+        app.layers.push(other);
+        app.selected = Some(Selection::Layer(0));
+        app.invalidate();
+        app.rebuild();
+        app.tools = Tool::Transform;
+        let bounds_a = app.placement_bounds().unwrap();
+        app.selected = Some(Selection::Layer(1));
+        assert_eq!(app.placement_bounds().unwrap()[0], Point::new(70., 65.));
+        app.selected = Some(Selection::Layer(0));
+        assert_eq!(app.placement_bounds().unwrap(), bounds_a);
+        let original = app.export_commands(false).unwrap().gcode.clone();
+        let fixed = app.planned[1].points.clone();
+        let fixed_command = "G1 X86.000 Y72.000 F1800.000";
+        assert!(original.contains(fixed_command));
+        let draw = |app: &mut Studio, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1100.0, 820.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.canvas(ui));
+                },
+            )
+        };
+        let frame = draw(&mut app, vec![]);
+        let paper = frame
+            .shapes
+            .iter()
+            .find_map(|item| match &item.shape {
+                egui::Shape::Rect(shape) if shape.fill == PAPER => Some(shape.rect),
+                _ => None,
+            })
+            .unwrap();
+        let map = CanvasMap {
+            anchor: paper.left_bottom(),
+            scale: paper.width() / 100.,
+        };
+        let from = map.screen(bounds_a[2]);
+        let to = map.screen(Point::new(60., 60.));
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(from), pointer(from, true)],
+        );
+        let dragging = draw(&mut app, vec![egui::Event::PointerMoved(to)]);
+        let unchanged_line = |shapes: &[egui::epaint::ClippedShape]| {
+            shapes.iter().any(|item| match &item.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    points[0].distance(map.screen(fixed[0])) < 0.01
+                        && points[1].distance(map.screen(fixed[1])) < 0.01
+                }
+                _ => false,
+            })
+        };
+        assert!(
+            app.placement_drag
+                .as_ref()
+                .unwrap()
+                .affects(&app.planned[0])
+        );
+        assert!(unchanged_line(&frame.shapes));
+        assert!(unchanged_line(&dragging.shapes));
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(to), pointer(to, false)],
+        );
+        app.rebuild();
+        assert_eq!(app.planned[1].points, fixed);
+        assert!(
+            app.export_commands(false)
+                .unwrap()
+                .gcode
+                .contains(fixed_command)
+        );
+        assert!(
+            app.export_commands(false)
+                .unwrap()
+                .gcode
+                .contains("G1 X60.000 Y60.000 F1800.000")
+        );
+        let project = Project::from_json(&app.as_project().to_json().unwrap()).unwrap();
+        let mut reopened = Studio::default();
+        reopened.apply_project(PathBuf::from("example.penplot"), project);
+        reopened.rebuild();
+        assert_eq!(
+            reopened.export_commands(false).unwrap().gcode,
+            app.export_commands(false).unwrap().gcode,
+        );
+        app.undo();
+        app.rebuild();
+        assert_eq!(app.export_commands(false).unwrap().gcode, original);
+    }
+
+    #[test]
+    fn moving_selected_layer_past_visible_min_does_not_move_other_layer() {
+        let mut app = Studio::default();
+        app.options.scale = 1.25;
+        app.options.rotation_deg = 22.5;
+        app.options.optimize = false;
+        app.add_mark(vec![Point::new(30., 30.), Point::new(40., 40.)], false)
+            .unwrap();
+        let mut other = app.layers[0].clone();
+        other.name = "Other layer".into();
+        let mut strokes = other.strokes.to_vec();
+        for p in &mut strokes[0].points {
+            p.x += 20.0;
+        }
+        other.strokes = strokes.into();
+        app.layers.push(other);
+        app.invalidate();
+        app.rebuild();
+        let fixed = app.planned[1].points.clone();
+        let first = app.planned[0].points[0];
+        let movement = PlacementMotion::Move(Point::new(-18., -12.));
+        app.transform_layer(0, movement).unwrap();
+        app.rebuild();
+        assert!(app.planned[0].points[0].distance(movement.apply(first)) < 1e-8);
+        for (actual, expected) in app.planned[1].points.iter().zip(fixed) {
+            assert!(actual.distance(expected) < 1e-8);
+        }
     }
 
     #[test]
