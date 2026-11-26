@@ -62,7 +62,9 @@ def main():
         raise SystemExit("Expected Windows x64 MSVC or GNU target")
     files = {name: Path(binary_dir) / name for name in ("penplot-studio.exe", "penplot.exe")}
     for name in ("README.md", "docs/K9.md", "docs/MACHINE-PRESETS.md",
-                 "docs/TRAVEL_SMOOTHING.ja.md",
+                 "docs/TRAVEL_SMOOTHING.ja.md", "docs/RASTER-COLOR.ja.md",
+                 "docs/releases/v0.10.0.md", "scripts/make-raster-examples.py",
+                 "examples/color-card.png", "examples/clean-scan.png",
                  "examples/alignment-card.svg", "examples/calibration.dxf"):
         files[name] = Path(name)
     for name in ("docs/studio-preview.png", "docs/studio-lifts.png",
@@ -70,9 +72,12 @@ def main():
                  "docs/screenshots/studio-v0.5.0-gcode-preview.png"):
         if Path(name).exists():
             files[name] = Path(name)
+    for file in Path("docs/screenshots").glob("studio-v0.10.0-*.png"):
+        files[str(file).replace("\\", "/")] = file
     docs = {name: file.read_bytes() for name, file in files.items()}
     version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     docs["VERSION.txt"] = f"Penplot-Gcoder v{version}\nTarget: {target}\n".encode("utf-8")
+    docs["SOURCE_COMMIT.txt"] = subprocess.check_output(["git", "rev-parse", "HEAD"])
     docs["THIRD-PARTY-NOTICES.txt"] = notices(target).encode()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for name, data in sorted(docs.items()):

@@ -49,6 +49,10 @@ pub fn raster(bytes: &[u8], options: &ImportOptions) -> Result<Artwork, String> 
         .decode()
         .map_err(|e| format!("Raster decoding: {e}"))?
         .into_rgba8();
+    options.processing.validate()?;
+    if options.processing.mode == crate::RasterMode::Color {
+        return crate::raster_processing::colors(&rgba, options);
+    }
     let mut mask = rgba
         .pixels()
         .map(|pixel| {
@@ -59,9 +63,17 @@ pub fn raster(bytes: &[u8], options: &ImportOptions) -> Result<Artwork, String> 
             u8::from(a != 0 && ((luma <= u32::from(options.threshold)) != options.invert))
         })
         .collect::<Vec<_>>();
+    if options.processing.mode == crate::RasterMode::CleanLine {
+        mask = crate::raster_processing::clean_mask(&rgba, options);
+    }
     drop(rgba);
     let mm = 25.4 / options.dpi;
-    match options.trace {
+    let mode = if options.processing.mode == crate::RasterMode::CleanLine {
+        TraceMode::Centerline
+    } else {
+        options.trace
+    };
+    match mode {
         TraceMode::Outline => trace(&mut mask, width, height, mm),
         TraceMode::Centerline => {
             let art = centerline::trace(
@@ -81,7 +93,7 @@ pub fn raster(bytes: &[u8], options: &ImportOptions) -> Result<Artwork, String> 
     }
 }
 
-fn trace(mask: &mut [u8], width: u32, height: u32, mm: f64) -> Result<Artwork, String> {
+pub(crate) fn trace(mask: &mut [u8], width: u32, height: u32, mm: f64) -> Result<Artwork, String> {
     let mut artwork = Artwork::default();
     let stride = width + 1;
     let mut queue = Vec::new();
@@ -202,6 +214,7 @@ mod tests {
 
     fn options() -> ImportOptions {
         ImportOptions {
+            processing: Default::default(),
             threshold: 127,
             invert: false,
             dpi: 25.4,

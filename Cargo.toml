@@ -1,6 +1,6 @@
 [package]
 name = "penplot-gcoder"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Offline pen plotter workstation and G-code compiler"
@@ -26,7 +26,7 @@ desktop = ["dep:eframe", "dep:rfd"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 tempfile = "3"
 usvg = { version = "=0.45.1", default-features = false }
 rustybuzz = "=0.20.1"

@@ -632,6 +632,7 @@ pub fn generate_with_travel(
 
     z_line(&mut result.gcode, up, profile.pen_up_speed);
     let mut last_end: Option<[Point; 2]> = None;
+    let mut current_ink = None;
     for (index, stroke) in strokes.iter().enumerate() {
         remaining = remaining
             .checked_sub(stroke.points.len().saturating_add(1))
@@ -652,6 +653,17 @@ pub fn generate_with_travel(
         }
         if points.len() < 2 {
             continue;
+        }
+        let ink = crate::ink_rgb(&stroke.layer);
+        if ink != current_ink {
+            let rgb = ink.unwrap_or([0, 0, 0]);
+            writeln!(
+                result.gcode,
+                "; INK #{:02X}{:02X}{:02X}",
+                rgb[0], rgb[1], rgb[2]
+            )
+            .expect("writing to String");
+            current_ink = ink;
         }
         let first = points[0];
         if stroke.closed && distance(first, *points.last().expect("nonempty")) != 0.0 {

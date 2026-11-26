@@ -4,8 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
 mod centerline;
+mod color_export;
 mod geometry;
 mod import_raster;
+mod raster_processing;
+pub use color_export::{ColorJob, color_jobs, ink_rgb, save_color_jobs};
+pub use raster_processing::{RasterMode, RasterProcessing};
 mod import_vector;
 mod machine;
 mod project;
@@ -73,6 +77,8 @@ impl TraceMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportOptions {
+    #[serde(default, skip_serializing_if = "RasterProcessing::is_default")]
+    pub processing: RasterProcessing,
     pub threshold: u8,
     pub invert: bool,
     pub dpi: f64,
@@ -83,6 +89,7 @@ pub struct ImportOptions {
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
+            processing: RasterProcessing::default(),
             threshold: 128,
             invert: false,
             dpi: 96.0,
@@ -128,6 +135,7 @@ pub fn import_bytes(filename: &str, bytes: &[u8], opts: &ImportOptions) -> Resul
     if !opts.dpi.is_finite() || !(1.0..=9600.0).contains(&opts.dpi) {
         return Err("DPI must be 1 to 9600".into());
     }
+    opts.processing.validate()?;
     let art = match Path::new(filename)
         .extension()
         .and_then(|v| v.to_str())

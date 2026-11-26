@@ -13,6 +13,7 @@ struct Segment {
     a: Point,
     b: Point,
     pen_up: bool,
+    color: Color32,
 }
 
 #[derive(Debug)]
@@ -52,8 +53,13 @@ impl CommandPreview {
         };
         let mut previous = None;
         let mut pen_up = true;
+        let mut color = DRAW;
         for line in gcode.lines() {
-            if let Some(z) = line.strip_prefix("G1 Z") {
+            if let Some(ink) = line.strip_prefix("; INK ") {
+                if let Some([r, g, b]) = penplot::ink_rgb(ink) {
+                    color = Color32::from_rgb(r, g, b);
+                }
+            } else if let Some(z) = line.strip_prefix("G1 Z") {
                 if let Some(z) = z
                     .split_ascii_whitespace()
                     .next()
@@ -87,6 +93,7 @@ impl CommandPreview {
                             a: before,
                             b: next,
                             pen_up,
+                            color,
                         });
                     }
                     *count += 1;
@@ -115,7 +122,14 @@ impl CommandPreview {
                 if pen_up { TRAVEL } else { DRAW },
             );
             for segment in self.segments.iter().filter(|s| s.pen_up == pen_up) {
-                painter.line_segment([map(segment.a), map(segment.b)], ink);
+                painter.line_segment(
+                    [map(segment.a), map(segment.b)],
+                    if pen_up {
+                        ink
+                    } else {
+                        Stroke::new(ink.width, segment.color)
+                    },
+                );
             }
         }
         painter.text(
@@ -191,7 +205,8 @@ impl ExportInspection {
         ui.horizontal_wrapped(|ui| {
             if !self.air_run {
                 ui.label(
-                    egui::RichText::new("Blue: pen down").color(Color32::from_rgb(117, 184, 244)),
+                    egui::RichText::new("Pen down: layer color")
+                        .color(Color32::from_rgb(117, 184, 244)),
                 );
                 ui.checkbox(&mut self.show_travel, "Show pen-up moves");
             }
@@ -259,6 +274,42 @@ mod tests {
             group: 0,
             layer: "test".into(),
         }
+    }
+
+    #[test]
+    fn command_preview_uses_emitted_black_red_and_blue_pen_comments() {
+        let profile = Profile::default();
+        let paths: Vec<_> = ["#000000", "#DC4848", "#377DE1"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, layer)| penplot::Stroke {
+                points: vec![
+                    Point::new(10. + 10. * i as f64, 10.),
+                    Point::new(15. + 10. * i as f64, 10.),
+                ],
+                layer: layer.into(),
+                group: 0,
+                closed: false,
+                filled: false,
+            })
+            .collect();
+        let out = penplot::generate(&paths, &profile).unwrap();
+        let preview =
+            CommandPreview::from_commands(&out.gcode, &profile, false, MAX_RENDER_SEGMENTS);
+        let colors: Vec<_> = preview
+            .segments
+            .iter()
+            .filter(|s| !s.pen_up)
+            .map(|s| s.color)
+            .collect();
+        assert_eq!(
+            colors,
+            vec![
+                Color32::BLACK,
+                Color32::from_rgb(220, 72, 72),
+                Color32::from_rgb(55, 125, 225)
+            ]
+        );
     }
 
     #[test]

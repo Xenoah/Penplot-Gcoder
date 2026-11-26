@@ -838,6 +838,64 @@ mod tests {
     }
 
     #[test]
+    fn hiding_all_colors_and_reopening_keeps_each_pass_on_the_same_paper_xy() {
+        let mut app = Studio {
+            options: JobOptions {
+                x: 12.,
+                y: 14.,
+                scale: 0.8,
+                rotation_deg: 23.,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (i, color) in ["#FF0000", "#0000FF"].into_iter().enumerate() {
+            app.layers.push(Layer {
+                name: color.into(),
+                visible: true,
+                raster: None,
+                text: None,
+                strokes: vec![Stroke {
+                    points: vec![
+                        Point::new(10. + i as f64 * 30., 10.),
+                        Point::new(15. + i as f64 * 30., 20.),
+                    ],
+                    layer: color.into(),
+                    group: 0,
+                    closed: false,
+                    filled: false,
+                }]
+                .into(),
+            });
+        }
+        app.rebuild();
+        let original = penplot::color_jobs(&app.planned, &app.profile, false, false).unwrap();
+        app.set_layer_visibility(0, false);
+        app.set_layer_visibility(1, false);
+        let saved = app.as_project().to_json().unwrap();
+        let project = Project::from_json(&saved).unwrap();
+        app.apply_project("colors.penplot".into(), project);
+        for i in [1, 0] {
+            app.set_layer_visibility(i, true);
+            app.invalidate();
+            app.rebuild();
+            let pass = penplot::color_jobs(&app.planned, &app.profile, false, false).unwrap();
+            assert_eq!(pass.len(), 1);
+            let expected = original.iter().find(|j| j.color == pass[0].color).unwrap();
+            assert_eq!(expected.output.gcode, pass[0].output.gcode);
+            app.set_layer_visibility(i, false);
+        }
+        app.set_layer_visibility(0, true);
+        app.set_layer_visibility(1, true);
+        app.invalidate();
+        app.rebuild();
+        let restored = penplot::color_jobs(&app.planned, &app.profile, false, false).unwrap();
+        for (a, b) in original.iter().zip(restored) {
+            assert_eq!(a.output.gcode, b.output.gcode);
+        }
+    }
+
+    #[test]
     fn layer_eye_toggles_output_without_selecting_or_shifting_the_neighbor() {
         let mut app = Studio::default();
         app.options.optimize = false;

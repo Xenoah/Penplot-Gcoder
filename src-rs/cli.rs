@@ -29,6 +29,15 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --threshold 0..255   raster foreground brightness cutoff (default 128)
   --invert             select bright instead of dark pixels
   --trace outline|centerline   trace raster contours (default) or single strokes
+  --raster threshold|clean|color   classic trace, clean line art, or color hatch
+  --clean-radius PX    local background radius 2..128 (default 16)
+  --ink-contrast N     local ink contrast 1..80 (default 12; lower keeps faint ink)
+  --speckle PIXELS     remove connected dots <= 0..100 pixels (clean only; default 3)
+  --palette N          maximum 2..8 estimated pen colors (default 4)
+  --include-background retain white color regions (transparent pixels stay empty)
+  --white-cutoff N     exclude pixels with all RGB channels >= 128..255 (default 245)
+  --hatch-only         omit raster outlines when hatching (color always defaults to this)
+  --colors-dir FOLDER  convert to a NEW folder of separate pen passes + PENS.txt
   --tolerance MM       vector curve flatness (default 0.1)
   --                   treat remaining arguments as input paths
 
@@ -123,6 +132,8 @@ fn run(mut it: Args) -> Result<(), String> {
     let mut supplied_job_settings = false;
     let mut minimum = None;
     let mut smoothing = None;
+    let mut colors_dir = None;
+    let mut hatch_only = false;
     while let Some(arg) = it.next() {
         let flag = arg.to_str().unwrap_or("");
         if flag.starts_with('-')
@@ -135,6 +146,7 @@ fn run(mut it: Args) -> Result<(), String> {
                     | "-o"
                     | "--calibrated"
                     | "--air-run"
+                    | "--colors-dir"
                     | "--min-image-stroke"
             )
         {
@@ -153,6 +165,47 @@ fn run(mut it: Args) -> Result<(), String> {
             "--output" | "-o" => output = Some(PathBuf::from(value(&mut it, "output")?)),
             "--calibrated" => calibrated = true,
             "--air-run" => air = true,
+            "--colors-dir" => colors_dir = Some(PathBuf::from(value(&mut it, "--colors-dir")?)),
+            "--hatch-only" => hatch_only = true,
+            "--raster" => {
+                import.processing.mode = match value(&mut it, "--raster")?.to_str() {
+                    Some("threshold") => penplot::RasterMode::Threshold,
+                    Some("clean") => penplot::RasterMode::CleanLine,
+                    Some("color") => penplot::RasterMode::Color,
+                    _ => return Err("--raster must be threshold, clean or color".into()),
+                }
+            }
+            "--palette" => {
+                import.processing.palette_size = value(&mut it, "--palette")?
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--palette must be 2..8")?
+            }
+            "--include-background" => import.processing.exclude_background = false,
+            "--white-cutoff" => {
+                import.processing.background_cutoff = value(&mut it, "--white-cutoff")?
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--white-cutoff must be 128..255")?
+            }
+            "--clean-radius" => {
+                import.processing.radius = value(&mut it, "--clean-radius")?
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--clean-radius must be 2..128")?
+            }
+            "--ink-contrast" => {
+                import.processing.contrast = value(&mut it, "--ink-contrast")?
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--ink-contrast must be 1..80")?
+            }
+            "--speckle" => {
+                import.processing.speckle = value(&mut it, "--speckle")?
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--speckle must be 0..100")?
+            }
             "--fit" => margin = Some(num(&mut it, "--fit")?),
             "--scale" => {
                 opts.scale = num(&mut it, "--scale")?;
@@ -217,12 +270,17 @@ fn run(mut it: Args) -> Result<(), String> {
                 .into(),
         );
     }
-    if action == "convert"
-        && (output.is_none() || !calibrated || (!is_project && profile.is_none()))
-    {
-        return Err("Export requires -o FILE, --calibrated and an explicit --profile FILE or saved .penplot project".into());
+    if output.is_some() && colors_dir.is_some() {
+        return Err("Use -o OR --colors-dir, not both.".into());
     }
-    if action == "check" && output.is_some() {
+    if action == "convert"
+        && ((output.is_none() && colors_dir.is_none())
+            || !calibrated
+            || (!is_project && profile.is_none()))
+    {
+        return Err("Export requires -o FILE or --colors-dir NEW_FOLDER, --calibrated and an explicit --profile FILE or saved .penplot project".into());
+    }
+    if action == "check" && (output.is_some() || colors_dir.is_some()) {
         return Err("check does not write files; use convert".into());
     }
     let mut strokes = Vec::new();
@@ -250,7 +308,16 @@ fn run(mut it: Args) -> Result<(), String> {
             }
             penplot::append_layer(&mut strokes, &art.strokes, index)?;
             if penplot::is_raster_filename(&path.to_string_lossy()) {
-                raster.insert(index, penplot::RasterSettings::from_job(&opts));
+                let mut settings = penplot::RasterSettings::from_job(&opts);
+                if import.processing.mode == penplot::RasterMode::Color {
+                    if settings.fill == Fill::None {
+                        settings.fill = Fill::Lines;
+                    }
+                    settings.outline = false;
+                } else if hatch_only {
+                    settings.outline = false;
+                }
+                raster.insert(index, settings);
             }
         }
         profile
@@ -294,6 +361,15 @@ fn run(mut it: Args) -> Result<(), String> {
         program.seconds,
         if air { "AIR RUN" } else { "PLOT" }
     );
+    if let Some(path) = colors_dir {
+        let jobs = penplot::color_jobs(&routes, &p, air, opts.smooth_pen_up)?;
+        penplot::save_color_jobs(&path, &jobs)?;
+        println!(
+            "Wrote {} pen passes to {}. Follow PENS.txt; keep paper and XY origin fixed.",
+            jobs.len(),
+            path.display()
+        );
+    }
     if let Some(path) = output {
         penplot::save_file(&path, program.gcode.as_bytes(), false)?;
         println!("Wrote {}", path.display());

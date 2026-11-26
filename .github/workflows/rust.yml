@@ -35,6 +35,9 @@ jobs:
       - name: Package Windows binaries, examples and attributions
         if: runner.os == 'Windows'
         run: python scripts/package-windows.py x86_64-pc-windows-msvc target/release ${{ steps.package-name.outputs.name }}.zip
+      - name: Verify archive provenance and Windows x64 binaries
+        if: runner.os == 'Windows'
+        run: python scripts/verify-windows-package.py ${{ steps.package-name.outputs.name }}.zip ${{ github.sha }}
       - name: Archive portable Windows binaries
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4

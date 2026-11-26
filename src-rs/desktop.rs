@@ -252,10 +252,25 @@ pub fn run() -> Result<(), String> {
                 style.spacing.button_padding = egui::vec2(8.0, 4.0);
             });
             let japanese = install_system_font(&cc.egui_ctx);
-            Ok(Box::new(Studio {
+            let mut app = Studio {
                 japanese,
                 ..Studio::default()
-            }))
+            };
+            let paths: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+            if paths.len() == 1
+                && paths[0]
+                    .extension()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("penplot"))
+            {
+                match penplot::read_limited(&paths[0]).and_then(|bytes| Project::from_json(&bytes))
+                {
+                    Ok(project) => app.apply_project(paths[0].clone(), project),
+                    Err(error) => app.status = error,
+                }
+            } else {
+                app.begin_import(&cc.egui_ctx, paths);
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| format!("Could not open the desktop window: {error}"))
@@ -313,8 +328,12 @@ impl Studio {
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(5.0);
         ui.horizontal_wrapped(|ui| {
-            ui.heading(RichText::new("PENPLOT").strong().color(ACCENT));
-            ui.label(RichText::new("STUDIO  /  RUST").small().weak());
+            ui.heading(RichText::new(APP_NAME).strong().color(ACCENT));
+            ui.label(
+                RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .small()
+                    .weak(),
+            );
             ui.separator();
             let busy = self.text_dialog.is_some()
                 || self.import_task.is_some()
@@ -386,6 +405,9 @@ impl Studio {
             {
                 self.request_export(self.air_first);
             }
+            if ui.add_enabled(enabled, egui::Button::new("Export colors…"))
+                .on_hover_text("Write a NEW folder with one G-code file per pen and a pen-change guide. Keeps paper XY fixed.")
+                .clicked() { self.save_colors(self.air_first); }
             ui.checkbox(&mut self.air_first, "Air run first")
                 .on_hover_text("Air run follows the same XY route but never lowers the pen.");
             if ui
@@ -530,15 +552,29 @@ impl Studio {
                 .push(format!("{}: workspace geometry limit reached.", item.name));
             return;
         }
+        let mut groups = std::collections::BTreeMap::<String, Vec<Stroke>>::new();
+        for stroke in item.artwork.strokes {
+            groups.entry(stroke.layer.clone()).or_default().push(stroke);
+        }
+        if self.layers.len() + groups.len() > MAX_LAYER_COUNT {
+            self.notices.push("Color import exceeds 128 layers.".into());
+            return;
+        }
         self.record_layers();
         self.notices.extend(item.artwork.warnings);
-        self.layers.push(Layer {
-            name: item.name,
-            strokes: item.artwork.strokes.into(),
-            visible: true,
-            raster: Some(raster),
-            text: None,
-        });
+        for (color, strokes) in groups {
+            self.layers.push(Layer {
+                name: if penplot::ink_rgb(&color).is_some() {
+                    format!("{} {color}", item.name)
+                } else {
+                    item.name.clone()
+                },
+                strokes: strokes.into(),
+                visible: true,
+                raster: Some(raster.clone()),
+                text: None,
+            });
+        }
         self.selected = Some(Selection::Layer(self.layers.len() - 1));
         self.status = "Image layer imported. Check placement before export.".into();
         self.invalidate();
@@ -929,6 +965,41 @@ impl Studio {
         match self.export_commands(air_run) {
             Ok(output) => self.open_gcode_snapshot(None, air_run, output),
             Err(error) => self.status = error,
+        }
+    }
+
+    fn save_colors(&mut self, air: bool) {
+        if !self.can_export() {
+            self.status = self.export_unavailable_reason();
+            return;
+        }
+        let jobs = match penplot::color_jobs(
+            &self.planned,
+            &self.profile,
+            air,
+            self.options.smooth_pen_up,
+        ) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let dialog = rfd::FileDialog::new()
+            .set_title("Choose a NEW color-pass folder name")
+            .set_file_name(if air { "Color-air-run" } else { "Color-plot" });
+        if let Some(path) = dialog.save_file() {
+            match penplot::save_color_jobs(&path, &jobs) {
+                Ok(()) => {
+                    self.last_export_dir = path.parent().map(Path::to_path_buf);
+                    self.status = format!(
+                        "Saved {} pen passes to {}. Follow PENS.txt; keep paper and XY origin fixed between pens.",
+                        jobs.len(),
+                        path.display()
+                    );
+                }
+                Err(e) => self.status = e,
+            }
         }
     }
 
@@ -2421,7 +2492,14 @@ impl Studio {
                 .zip(self.route_targets.get(index).copied().flatten())
                 .is_some_and(|(selected, target)| selected.contains(target));
             let ink = if selected {
-                Ink::new(3.0, Color32::from_rgb(20, 150, 115))
+                Ink::new(
+                    2.4,
+                    if penplot::ink_rgb(&stroke.layer).is_some() {
+                        color
+                    } else {
+                        Color32::from_rgb(20, 150, 115)
+                    },
+                )
             } else {
                 Ink::new(if active { 1.7 } else { 1.25 }, color)
             };
@@ -2715,7 +2793,21 @@ fn trace_segments_with_curves(
 }
 
 fn projected_min(layers: &[Layer], scale: f64, sin: f64, cos: f64) -> Option<Point> {
-    projected_bounds(layers, scale, sin, cos).map(|(lo, _)| lo)
+    projected_bounds(layers, scale, sin, cos)
+        .map(|(lo, _)| lo)
+        .or_else(|| {
+            // Keep an anchor while ALL layers are hidden, including save/reopen.
+            // Visibility transitions rebase to/from this deterministic reference.
+            let all: Vec<_> = layers
+                .iter()
+                .cloned()
+                .map(|mut layer| {
+                    layer.visible = true;
+                    layer
+                })
+                .collect();
+            projected_bounds(&all, scale, sin, cos).map(|(lo, _)| lo)
+        })
 }
 
 fn projected_bounds(layers: &[Layer], scale: f64, sin: f64, cos: f64) -> Option<(Point, Point)> {
@@ -2749,14 +2841,9 @@ fn format_mm(value: f64) -> String {
 }
 
 fn route_color(layer: &str) -> Color32 {
-    let layer = layer.split_once(':').map_or(layer, |(_, style)| style);
-    if let Some(hex) = layer.strip_prefix('#').filter(|hex| hex.len() == 6)
-        && let Ok(code) = u32::from_str_radix(hex, 16)
-    {
-        let tone = |shift: u32| ((((code >> shift) & 0xffu32) as f32) * 0.65).round() as u8;
-        return Color32::from_rgb(tone(16), tone(8), tone(0));
-    }
-    Color32::from_rgb(37, 75, 124)
+    penplot::ink_rgb(layer).map_or(Color32::from_rgb(37, 75, 124), |[r, g, b]| {
+        Color32::from_rgb(r, g, b)
+    })
 }
 
 fn paint_dashes(painter: &egui::Painter, from: Pos2, to: Pos2, ink: Ink) {

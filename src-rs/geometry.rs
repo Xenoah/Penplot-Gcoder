@@ -57,6 +57,8 @@ fn is_zero(value: &f64) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RasterSettings {
+    #[serde(default = "default_outline", skip_serializing_if = "is_true")]
+    pub outline: bool,
     #[serde(alias = "mode", alias = "fill_mode")]
     pub fill: Fill,
     #[serde(alias = "spacing", alias = "hatch_spacing_mm")]
@@ -65,10 +67,18 @@ pub struct RasterSettings {
     pub hatch_angle: f64,
 }
 
+fn default_outline() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 impl Default for RasterSettings {
     fn default() -> Self {
         Self {
             fill: Fill::None,
+            outline: true,
             hatch_spacing: 1.,
             hatch_angle: 45.,
         }
@@ -78,6 +88,7 @@ impl Default for RasterSettings {
 impl RasterSettings {
     pub fn from_job(o: &JobOptions) -> Self {
         Self {
+            outline: true,
             fill: o.fill,
             hatch_spacing: o.hatch_spacing,
             hatch_angle: o.hatch_angle,
@@ -280,6 +291,10 @@ pub fn plan_with_raster(
                 )?;
             }
         }
+        out.retain(|s| {
+            let settings = raster(&s.layer).unwrap_or(&job);
+            settings.outline || settings.fill == Fill::None || !s.filled || !s.closed
+        });
         out.extend(fill);
     }
     let mut removed_count = 0;

@@ -1,6 +1,6 @@
 //! Image import keeps the prior successful outline while a newer threshold is traced.
 use super::*;
-use penplot::TraceMode;
+use penplot::{RasterMode, TraceMode};
 
 pub(super) const DEBOUNCE: Duration = Duration::from_millis(140);
 
@@ -10,7 +10,7 @@ pub(super) struct RasterImport {
     draft: Option<Draft>,
 }
 
-type TraceResult = Result<Imported, String>;
+type TraceResult = Result<(Imported, Vec<Stroke>), String>;
 
 struct Draft {
     path: PathBuf,
@@ -20,6 +20,7 @@ struct Draft {
     revision: u64,
     completed: Option<u64>,
     preview: Option<Imported>,
+    preview_routes: Vec<Stroke>,
     error: Option<String>,
     worker: Option<(u64, mpsc::Receiver<TraceResult>)>,
 }
@@ -27,14 +28,20 @@ struct Draft {
 impl Draft {
     fn new(path: PathBuf, options: ImportOptions) -> Self {
         let now = std::time::Instant::now();
+        let mut fill = penplot::RasterSettings::default();
+        if options.processing.mode == RasterMode::Color {
+            fill.fill = Fill::Lines;
+            fill.outline = false;
+        }
         Self {
             path,
             options,
-            fill: Default::default(),
+            fill,
             last_edit: now.checked_sub(DEBOUNCE).unwrap_or(now),
             revision: 0,
             completed: None,
             preview: None,
+            preview_routes: Vec::new(),
             error: None,
             worker: None,
         }
@@ -81,7 +88,15 @@ impl Draft {
             match worker.try_recv() {
                 Ok(result) => {
                     self.worker = None;
-                    self.accept(revision, result);
+                    match result {
+                        Ok((item, routes)) => {
+                            if self.revision == revision {
+                                self.preview_routes = routes;
+                            }
+                            self.accept(revision, Ok(item));
+                        }
+                        Err(e) => self.accept(revision, Err(e)),
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.worker = None;
@@ -102,13 +117,22 @@ impl Draft {
         }
 
         let options = self.options.clone();
+        let fill = self.fill.clone();
         let revision = self.revision;
         let path = self.path.clone();
         let ctx = ctx.clone();
         let (sender, worker) = mpsc::channel();
         self.worker = Some((revision, worker));
         std::thread::spawn(move || {
-            let result = import_one(&path, &options);
+            let result = (|| {
+                let item = import_one(&path, &options)?;
+                let mut source = Vec::new();
+                penplot::append_layer(&mut source, &item.artwork.strokes, 0)?;
+                let layers = [(0, fill)].into_iter().collect();
+                let routes =
+                    penplot::plan_with_raster(&source, &JobOptions::default(), &layers)?.strokes;
+                Ok((item, routes))
+            })();
             let _ = sender.send(result);
             ctx.request_repaint();
         });
@@ -149,29 +173,20 @@ impl RasterImport {
             ui.heading("Import image");
             ui.label(draft.path.file_name().unwrap_or_default().to_string_lossy());
             let before = draft.options.clone();
-            ui.horizontal(|ui| {
-                ui.label("Threshold");
-                ui.add(egui::Slider::new(&mut draft.options.threshold, 0..=255));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Image DPI");
-                ui.add(
-                    egui::DragValue::new(&mut draft.options.dpi)
-                        .range(1.0..=9600.0)
-                        .speed(1.0),
-                );
-            });
-            ui.checkbox(&mut draft.options.invert, "Trace light instead of dark");
-            trace_mode_controls(ui, &mut draft.options.trace);
-            if draft.options != before {
-                draft.invalidate();
+            let before_fill = draft.fill.clone();
+            processing_controls(ui, &mut draft.options);
+            if before.processing.mode != draft.options.processing.mode && draft.options.processing.mode == RasterMode::Color {
+                draft.fill.fill = Fill::Lines;
+                draft.fill.outline = false;
             }
             ui.separator();
-            if draft.options.trace.is_outline() {
+            if regions(&draft.options) {
                 raster_fill_controls(ui, &mut draft.fill, "raster_import_fill");
             } else {
-                ui.small("Centerline paths are single strokes and are not hatched. Isolated dots may be omitted.");
+                draft.fill.fill = Fill::None;
+                ui.small("Single centerline strokes; no outline or hatch. Tiny isolated dots may be omitted.");
             }
+            if draft.options != before || draft.fill != before_fill { draft.invalidate(); }
             ui.separator();
             draft.poll(&ctx);
             ui.strong("Preview paths");
@@ -186,10 +201,18 @@ impl RasterImport {
                 ui.small(format!(
                     "{} paths.{}",
                     preview.artwork.strokes.len(),
-                    if draft.options.trace.is_outline() { " Fill is calculated after placement." } else { "" }
+                    if regions(&draft.options) { " Hatch shown at import size; spacing stays in paper mm after placement." } else { "" }
                 ));
             }
-            preview_outlines(ui, draft.preview.as_ref());
+            if draft.options.processing.mode == RasterMode::Color {
+                let colors: std::collections::BTreeSet<_> = draft.preview_routes.iter().filter_map(|s| penplot::ink_rgb(&s.layer)).collect();
+                ui.horizontal_wrapped(|ui| { for [r,g,b] in colors {
+                    ui.colored_label(Color32::from_rgb(r,g,b), "■");
+                    ui.monospace(format!("#{r:02X}{g:02X}{b:02X}"));
+                }});
+                ui.small("One editable layer per color. Export colors writes separate pen passes with shared paper coordinates.");
+            }
+            preview_outlines(ui, &draft.preview_routes);
             ui.horizontal(|ui| {
                 cancel = ui.button("Cancel").clicked();
                 add = ui
@@ -200,7 +223,7 @@ impl RasterImport {
         if add {
             let mut draft = self.draft.take().expect("add requires image draft");
             ctx.request_repaint();
-            if !draft.options.trace.is_outline() {
+            if !regions(&draft.options) {
                 draft.fill.fill = Fill::None;
             }
             return draft.preview.take().map(|item| (item, draft.fill));
@@ -210,6 +233,85 @@ impl RasterImport {
             ctx.request_repaint();
         }
         None
+    }
+}
+
+fn regions(options: &ImportOptions) -> bool {
+    options.processing.mode == RasterMode::Color
+        || (options.processing.mode == RasterMode::Threshold && options.trace.is_outline())
+}
+
+pub(super) fn processing_controls(ui: &mut egui::Ui, options: &mut ImportOptions) {
+    let label = match options.processing.mode {
+        RasterMode::Threshold => "Threshold (classic)",
+        RasterMode::CleanLine => "Clean line art",
+        RasterMode::Color => "Color hatch",
+    };
+    egui::ComboBox::from_id_salt("image_processing")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut options.processing.mode,
+                RasterMode::Threshold,
+                "Threshold (classic)",
+            );
+            ui.selectable_value(
+                &mut options.processing.mode,
+                RasterMode::CleanLine,
+                "Clean line art",
+            );
+            ui.selectable_value(
+                &mut options.processing.mode,
+                RasterMode::Color,
+                "Color hatch",
+            );
+        });
+    ui.horizontal(|ui| {
+        ui.label("Image DPI");
+        ui.add(
+            egui::DragValue::new(&mut options.dpi)
+                .range(1.0..=9600.0)
+                .speed(1.0),
+        );
+    });
+    match options.processing.mode {
+        RasterMode::Threshold => {
+            ui.add(egui::Slider::new(&mut options.threshold, 0..=255).text("Threshold"));
+            ui.checkbox(&mut options.invert, "Trace light instead of dark");
+            trace_mode_controls(ui, &mut options.trace);
+        }
+        RasterMode::CleanLine => {
+            ui.small("Local background correction + connected speckle removal + centerline trace.");
+            ui.add(
+                egui::Slider::new(&mut options.processing.radius, 2..=128)
+                    .text("Background radius (px)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut options.processing.contrast, 1..=80).text("Ink contrast"),
+            );
+            ui.add(
+                egui::Slider::new(&mut options.processing.speckle, 0..=100)
+                    .text("Remove dots ≤ px"),
+            );
+            ui.checkbox(&mut options.invert, "Trace light instead of dark");
+            ui.small("Lower contrast keeps faint lines. Increase radius for broader strokes; speckle 0 keeps small marks.");
+        }
+        RasterMode::Color => {
+            ui.add(
+                egui::Slider::new(&mut options.processing.palette_size, 2..=8).text("Maximum pens"),
+            );
+            ui.checkbox(
+                &mut options.processing.exclude_background,
+                "Exclude white background",
+            );
+            if options.processing.exclude_background {
+                ui.add(
+                    egui::Slider::new(&mut options.processing.background_cutoff, 128..=255)
+                        .text("White cutoff"),
+                );
+            }
+            ui.small("Transparent pixels stay empty. Colors are estimated from the image; choose matching pens.");
+        }
     }
 }
 
@@ -241,6 +343,7 @@ pub(super) fn raster_fill_controls(
             ui.selectable_value(&mut settings.fill, Fill::Cross, "Cross-hatch");
         });
     if settings.fill != Fill::None {
+        ui.checkbox(&mut settings.outline, "Draw outlines");
         ui.horizontal(|ui| {
             ui.label("Spacing (mm)");
             ui.add(
@@ -260,17 +363,16 @@ pub(super) fn raster_fill_controls(
     }
 }
 
-fn preview_outlines(ui: &mut egui::Ui, preview: Option<&Imported>) {
+fn preview_outlines(ui: &mut egui::Ui, strokes: &[Stroke]) {
     let (rect, painter) = ui.allocate_painter(
         Vec2::new(ui.available_width().clamp(100.0, 680.0), 210.0),
         Sense::hover(),
     );
     let rect = rect.rect;
     painter.rect_filled(rect, 4.0, PAPER);
-    let Some(preview) = preview else {
+    if strokes.is_empty() {
         return;
-    };
-    let strokes = &preview.artwork.strokes;
+    }
     let (mut minx, mut miny, mut maxx, mut maxy) = (
         f64::INFINITY,
         f64::INFINITY,
@@ -288,8 +390,8 @@ fn preview_outlines(ui: &mut egui::Ui, preview: Option<&Imported>) {
     let scale = (f64::from(rect.width() - 16.0) / (maxx - minx).max(1e-9))
         .min(f64::from(rect.height() - 16.0) / (maxy - miny).max(1e-9));
     let center = rect.center();
-    let ink = Ink::new(1.0, Color32::from_rgb(32, 40, 48));
     for stroke in strokes {
+        let ink = Ink::new(1.0, route_color(&stroke.layer));
         let mut coords: Vec<_> = stroke
             .points
             .iter()
@@ -313,6 +415,47 @@ mod tests {
             name: name.into(),
             artwork: Artwork::default(),
         }
+    }
+
+    #[test]
+    fn color_import_worker_adds_editable_layers_and_scaling_keeps_other_pen_fixed() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/color-card.png");
+        let mut options = ImportOptions::default();
+        options.processing.mode = RasterMode::Color;
+        let mut draft = Draft::new(path, options);
+        assert_eq!(draft.fill.fill, Fill::Lines);
+        assert!(!draft.fill.outline);
+        let ctx = egui::Context::default();
+        for _ in 0..200 {
+            draft.poll(&ctx);
+            if draft.is_current() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(draft.can_add(), "{:?}", draft.error);
+        assert!(draft.preview_routes.iter().all(|s| !s.closed));
+        let mut app = Studio::default();
+        app.add_raster_layer(draft.preview.take().unwrap(), draft.fill);
+        assert_eq!(app.layers.len(), 3);
+        app.rebuild();
+        let before = penplot::color_jobs(&app.planned, &app.profile, false, false).unwrap();
+        app.transform_layer(2, PlacementMotion::Scale(Point::new(0., 0.), 1.1))
+            .unwrap();
+        app.rebuild();
+        let after = penplot::color_jobs(&app.planned, &app.profile, false, false).unwrap();
+        assert_eq!(before[1].color, after[1].color);
+        assert_eq!(before[1].output.gcode, after[1].output.gcode);
+        let project = app.as_project();
+        assert!(
+            std::str::from_utf8(&project.to_json().unwrap())
+                .unwrap()
+                .contains("\"version\":4")
+        );
+        assert_eq!(
+            Project::from_json(&project.to_json().unwrap()).unwrap(),
+            project
+        );
     }
 
     #[test]
