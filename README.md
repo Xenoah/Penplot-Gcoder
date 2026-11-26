@@ -1,20 +1,24 @@
-# Penplot-Gcoder Studio
+# Penplot-Gcoder
 
 SVG・DXF・画像を読み込み、3D プリンター用のペン描画経路を編集・検査して `.GCODE` に保存するオフラインの Rust デスクトップアプリ。Windows 向け GUI と、GUI なしで同じファイルを生成できる CLI がある。**Python・クラウド・プリンターへの接続は不要**。
 
 ## ダウンロード
 
-[最新版の Windows x64 配布版](https://github.com/Xenoah/Penplot-Gcoder/releases/latest) ／ [v0.8.0 の使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/v0.8.0/README.md)
+[最新版の Windows x64 配布版](https://github.com/Xenoah/Penplot-Gcoder/releases/latest) ／ [v0.10.0 の使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/v0.10.0/docs/RASTER-COLOR.ja.md)
 
-## v0.5.0 の実画面（Linux 版）
+## v0.10.0 の実画面
 
-次の 2 枚は、v0.5.0 の Linux 版で撮影した画面です。この下にある `main` のソースからの手順・画面例は、旧版 v0.1.0 向けです。
+**Clean line art**：スキャン画像の背景ムラと点ノイズを抑え、細線の中心をプレビューします。
 
-![編集：左にツール、中央に描画面、右にレイヤー](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/7f6b5e4c770ffae7fb2132b418d6e0285f36e1ca/docs/screenshots/studio-v0.5.0-edit.png)
+![Penplot-Gcoder v0.10.0 の線画抽出画面](docs/screenshots/studio-v0.10.0-clean-line.png)
 
-![G-code Preview：機械設定、ペンの経路、生成コマンド](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/7f6b5e4c770ffae7fb2132b418d6e0285f36e1ca/docs/screenshots/studio-v0.5.0-gcode-preview.png)
+**Color hatch**：画像を色別レイヤーに分け、ペンで塗るハッチの軌跡を表示します。
 
-![実際の Studio の 2D プレビュー。実線は描画・オレンジ破線は移動経路](docs/studio-preview.png)
+![Penplot-Gcoder v0.10.0 の色別ハッチ画面](docs/screenshots/studio-v0.10.0-color-hatch.png)
+
+---
+
+以下のソースからの手順は、main の旧版（v0.1.0）向けです。最新版は上の配布版と操作ガイドを参照してください。
 
 ## まず試す（実機なし）
 
