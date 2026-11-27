@@ -2,7 +2,21 @@
 
 SVG・DXF・画像を読み込み、3D プリンター用のペン描画経路を編集・検査して `.GCODE` に保存するオフラインの Rust デスクトップアプリ。Windows 向け GUI と、GUI なしで同じファイルを生成できる CLI がある。**Python・クラウド・プリンターへの接続は不要**。
 
-## ダウンロード
+## ダウンロード（v0.12.0）
+
+[Windows x64 ZIP v0.12.0](https://github.com/Xenoah/Penplot-Gcoder/releases/download/v0.12.0/Penplot-Gcoder-v0.12.0-Windows-x64.zip) ／ [リリースノート](https://github.com/Xenoah/Penplot-Gcoder/releases/tag/v0.12.0) ／ [操作ガイド：ペン幅・生成・保存](https://github.com/Xenoah/Penplot-Gcoder/blob/f1b942d923a1b2fd14ebb9098d3a7825d41e7146/docs/PEN-WIDTH.ja.md) ／ [バケツ塗りの使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/f1b942d923a1b2fd14ebb9098d3a7825d41e7146/docs/BUCKET-FILL.ja.md)
+
+## v0.12.0 の実画面
+
+指定ペン幅より細い画像の線・狭い塗り部分を省略し、**1. Generate G-code → 2. Preview → 3. Export** の順に生成・確認・保存します。編集後は再生成が必要です。以下は同梱の合成素材を使った Linux 版の実アプリ画面です。
+
+![v0.12.0 ペン幅を考慮した水玉・斜線・クロスハッチの実画面](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/f1b942d923a1b2fd14ebb9098d3a7825d41e7146/docs/screenshots/studio-v0.12.0-pen-width.png)
+
+![v0.12.0 生成済みG-codeのプレビューとExportの実画面](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/f1b942d923a1b2fd14ebb9098d3a7825d41e7146/docs/screenshots/studio-v0.12.0-gcode-preview.png)
+
+画像の幅判定は取り込み時のDPI基準です。取り込み後の拡縮では再解析しないため、最終寸法に合うDPIで再取り込みしてください。塗りの余白は配置後の紙上mmで計算します。実機描画・Windows GUI・Linux保存ダイアログは未検証です。
+
+## 旧版のダウンロード（v0.11.0）
 
 [Windows x64 ZIP v0.11.0](https://github.com/Xenoah/Penplot-Gcoder/releases/download/v0.11.0/Penplot-Gcoder-v0.11.0-Windows-x64.zip) ／ [リリースノート](https://github.com/Xenoah/Penplot-Gcoder/releases/tag/v0.11.0) ／ [バケツ塗りの使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/v0.11.0/docs/BUCKET-FILL.ja.md)
 
