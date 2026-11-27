@@ -4,17 +4,17 @@ SVG・DXF・画像を読み込み、3D プリンター用のペン描画経路�
 
 ## ダウンロード
 
-[最新版の Windows x64 配布版](https://github.com/Xenoah/Penplot-Gcoder/releases/latest) ／ [v0.10.0 の使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/v0.10.0/docs/RASTER-COLOR.ja.md)
+[Windows x64 ZIP v0.11.0](https://github.com/Xenoah/Penplot-Gcoder/releases/download/v0.11.0/Penplot-Gcoder-v0.11.0-Windows-x64.zip) ／ [リリースノート](https://github.com/Xenoah/Penplot-Gcoder/releases/tag/v0.11.0) ／ [バケツ塗りの使い方](https://github.com/Xenoah/Penplot-Gcoder/blob/v0.11.0/docs/BUCKET-FILL.ja.md)
 
-## v0.10.0 の実画面
+## v0.11.0 の実画面
 
-**Clean line art**：スキャン画像の背景ムラと点ノイズを抑え、細線の中心をプレビューします。
+バケツで閉じた領域を選び、水玉・斜線・クロスハッチングで塗り分けます。密度で濃淡を変え、スライス前にグレースケールで仕上がりを確認できます。写真は Linux 版の実アプリです。
 
-![Penplot-Gcoder v0.10.0 の線画抽出画面](docs/screenshots/studio-v0.10.0-clean-line.png)
+![v0.11.0 水玉35%、斜線50%、クロスハッチ70%の実画面](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/e9b002eaed284887bbd06831bbc43c1f16724f90/docs/screenshots/studio-v0.11.0-bucket.png)
 
-**Color hatch**：画像を色別レイヤーに分け、ペンで塗るハッチの軌跡を表示します。
+![v0.11.0 クロスハッチの密度を20%に下げた実画面](https://raw.githubusercontent.com/Xenoah/Penplot-Gcoder/e9b002eaed284887bbd06831bbc43c1f16724f90/docs/screenshots/studio-v0.11.0-bucket-light.png)
 
-![Penplot-Gcoder v0.10.0 の色別ハッチ画面](docs/screenshots/studio-v0.10.0-color-hatch.png)
+[v0.10.0 の線画抽出・色別ハッチの画面](https://github.com/Xenoah/Penplot-Gcoder/releases/tag/v0.10.0)
 
 ---
 
