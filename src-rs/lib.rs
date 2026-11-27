@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
 mod bucket;
+mod pen_width;
 pub use bucket::{Pattern, PatternSettings, bucket_region, region_contains};
 mod centerline;
 mod color_export;

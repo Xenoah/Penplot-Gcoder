@@ -17,6 +17,8 @@ pub enum Fill {
 #[serde(deny_unknown_fields)]
 pub struct JobOptions {
     /// 1.0 = original metric size. Position anchors the rotated bounding box's lower left.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pen_width_mm: f64,
     pub scale: f64,
     pub rotation_deg: f64,
     pub x: f64,
@@ -33,6 +35,7 @@ pub struct JobOptions {
 impl Default for JobOptions {
     fn default() -> Self {
         Self {
+            pen_width_mm: 0.,
             scale: 1.,
             rotation_deg: 0.,
             x: 0.,
@@ -57,6 +60,8 @@ fn is_zero(value: &f64) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RasterSettings {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pen_width_mm: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<crate::PatternSettings>,
     #[serde(default = "default_outline", skip_serializing_if = "is_true")]
@@ -80,6 +85,7 @@ impl Default for RasterSettings {
     fn default() -> Self {
         Self {
             fill: Fill::None,
+            pen_width_mm: 0.,
             pattern: None,
             outline: true,
             hatch_spacing: 1.,
@@ -93,6 +99,7 @@ impl RasterSettings {
         Self {
             outline: true,
             pattern: None,
+            pen_width_mm: o.pen_width_mm,
             fill: o.fill,
             hatch_spacing: o.hatch_spacing,
             hatch_angle: o.hatch_angle,
@@ -100,6 +107,9 @@ impl RasterSettings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !self.pen_width_mm.is_finite() || !(0.0..=3.).contains(&self.pen_width_mm) {
+            return Err("Fill pen width must be 0 (off) to 3 mm".into());
+        }
         if let Some(pattern) = &self.pattern {
             pattern.validate()?;
             if self.outline || self.fill != Fill::Lines {
@@ -220,6 +230,7 @@ pub fn plan_with_raster(
         layers.get(&prefix.parse::<usize>().ok()?)
     };
     let job = RasterSettings::from_job(o);
+    job.validate()?;
     let b = rotated_bounds(strokes, o.rotation_deg)?;
     if ![o.scale, o.x, o.y]
         .iter()
@@ -300,6 +311,7 @@ pub fn plan_with_raster(
                 .pattern
                 .as_ref()
                 .map_or(settings.hatch_angle, |p| p.angle_deg);
+            let start = fill.len();
             hatch(
                 &rings,
                 layer,
@@ -326,6 +338,26 @@ pub fn plan_with_raster(
                     &mut budget,
                     allowed,
                 )?;
+            }
+            let width = settings
+                .pattern
+                .as_ref()
+                .map_or(settings.pen_width_mm, |p| {
+                    if p.clip_to_pen { p.pen_width_mm } else { 0. }
+                });
+            if width > 0. {
+                let candidates = fill.split_off(start);
+                for stroke in candidates {
+                    fill.extend(crate::pen_width::clip_hatch(
+                        &stroke,
+                        &rings,
+                        width,
+                        &mut budget,
+                    )?);
+                    if fill.len() > allowed {
+                        return Err("Pen-width clipped fill exceeds geometry limits".into());
+                    }
+                }
             }
         }
         out.retain(|s| {

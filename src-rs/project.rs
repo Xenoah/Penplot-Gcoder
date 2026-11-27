@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
-const SCHEMA: u32 = 5;
+const SCHEMA: u32 = 6;
 const MAX_LAYERS: usize = 128;
 const MAX_NAME: usize = 512;
 const MAX_COORD: f64 = 1e8;
@@ -116,12 +116,20 @@ impl Project {
         serde_json::to_writer(
             &mut buffer,
             &SaveProject {
-                version: if self
+                version: if self.options.pen_width_mm > 0.
+                    || self.import_options.processing.pen_width_mm > 0.
+                    || self.layers.iter().any(|l| {
+                        l.raster.as_ref().is_some_and(|r| {
+                            r.pen_width_mm > 0. || r.pattern.as_ref().is_some_and(|p| p.clip_to_pen)
+                        })
+                    }) {
+                    SCHEMA
+                } else if self
                     .layers
                     .iter()
                     .any(|l| l.raster.as_ref().is_some_and(|r| r.pattern.is_some()))
                 {
-                    SCHEMA
+                    5
                 } else if !self.import_options.processing.is_default()
                     || self
                         .layers
@@ -148,6 +156,7 @@ impl Project {
     fn validate(&self) -> Result<(), String> {
         self.profile.validate()?;
         self.import_options.processing.validate()?;
+        crate::RasterSettings::from_job(&self.options).validate()?;
         let options = &self.options;
         if !(0.0..=MAX_COORD).contains(&options.scale)
             || options.scale == 0.0

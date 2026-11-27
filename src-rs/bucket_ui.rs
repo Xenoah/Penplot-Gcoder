@@ -24,6 +24,10 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut PatternSettings, japanese:
             );
         });
     }
+    ui.checkbox(
+        &mut value.clip_to_pen,
+        title("Ignore parts thinner than pen", "ペン幅より細い部分を省く"),
+    );
     ui.horizontal(|ui| {
         ui.label(title("Pen width", "ペン幅"));
         ui.add(

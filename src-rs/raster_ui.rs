@@ -28,7 +28,10 @@ struct Draft {
 impl Draft {
     fn new(path: PathBuf, options: ImportOptions) -> Self {
         let now = std::time::Instant::now();
-        let mut fill = penplot::RasterSettings::default();
+        let mut fill = penplot::RasterSettings {
+            pen_width_mm: options.processing.pen_width_mm,
+            ..Default::default()
+        };
         if options.processing.mode == RasterMode::Color {
             fill.fill = Fill::Lines;
             fill.outline = false;
@@ -175,6 +178,7 @@ impl RasterImport {
             let before = draft.options.clone();
             let before_fill = draft.fill.clone();
             processing_controls(ui, &mut draft.options);
+            if before.processing.pen_width_mm != draft.options.processing.pen_width_mm { draft.fill.pen_width_mm = draft.options.processing.pen_width_mm; }
             if before.processing.mode != draft.options.processing.mode && draft.options.processing.mode == RasterMode::Color {
                 draft.fill.fill = Fill::Lines;
                 draft.fill.outline = false;
@@ -274,6 +278,14 @@ pub(super) fn processing_controls(ui: &mut egui::Ui, options: &mut ImportOptions
                 .speed(1.0),
         );
     });
+    pen_width_controls(
+        ui,
+        &mut options.processing.pen_width_mm,
+        "Ignore image details thinner than pen",
+    );
+    if options.processing.pen_width_mm > 0. {
+        ui.small("Measured at the image DPI before placement. Reimport if the final drawing scale changes.");
+    }
     match options.processing.mode {
         RasterMode::Threshold => {
             ui.add(egui::Slider::new(&mut options.threshold, 0..=255).text("Threshold"));
@@ -315,6 +327,24 @@ pub(super) fn processing_controls(ui: &mut egui::Ui, options: &mut ImportOptions
     }
 }
 
+pub(super) fn pen_width_controls(ui: &mut egui::Ui, width: &mut f64, label: &str) {
+    let mut on = *width > 0.;
+    if ui.checkbox(&mut on, label).changed() {
+        *width = if on { 0.3 } else { 0. };
+    }
+    if on {
+        ui.horizontal(|ui| {
+            ui.label("Pen width");
+            ui.add(
+                egui::DragValue::new(width)
+                    .range(0.05..=3.)
+                    .speed(0.01)
+                    .suffix(" mm"),
+            );
+        });
+    }
+}
+
 pub(super) fn trace_mode_controls(ui: &mut egui::Ui, trace: &mut TraceMode) -> bool {
     let before = *trace;
     ui.horizontal(|ui| {
@@ -343,6 +373,11 @@ pub(super) fn raster_fill_controls(
             ui.selectable_value(&mut settings.fill, Fill::Cross, "Cross-hatch");
         });
     if settings.fill != Fill::None {
+        pen_width_controls(
+            ui,
+            &mut settings.pen_width_mm,
+            "Keep fill inside pen-width clearance",
+        );
         ui.checkbox(&mut settings.outline, "Draw outlines");
         ui.horizontal(|ui| {
             ui.label("Spacing (mm)");
@@ -494,7 +529,7 @@ mod tests {
             assert_eq!(draft.fill.hatch_spacing, 2.5);
             assert_eq!(draft.preview.as_ref().unwrap().name, "retained");
             assert!(draft.can_add());
-            assert!(!app.can_export());
+            assert!(!app.can_generate());
         }
         app.raster_import.cancel_current();
         assert!(!app.raster_import.is_busy());

@@ -602,7 +602,7 @@ mod tests {
         assert!(app.preview_dirty && app.output.is_none());
         app.options.min_image_stroke_mm = 10_000.;
         app.rebuild();
-        assert!(app.can_export());
+        assert!(app.can_generate());
         assert_eq!(app.planned.len(), 6);
         assert!(
             app.route_targets
@@ -611,7 +611,7 @@ mod tests {
         );
         let first = app.as_project().to_json().unwrap();
         assert!(app.delete_object(Selection::Layer(0)));
-        assert!(app.layers.is_empty() && !app.can_export());
+        assert!(app.layers.is_empty() && !app.can_generate());
         app.undo();
         assert_eq!(first, app.as_project().to_json().unwrap());
         app.redo();
@@ -643,7 +643,7 @@ mod tests {
         app.rebuild();
         assert_eq!(app.planned.len(), 1);
         assert!(app.planned[0].closed && !app.planned[0].filled);
-        assert!(app.can_export());
+        assert!(app.can_generate());
         let json = app.as_project().to_json().unwrap();
         let project = Project::from_json(&json).unwrap();
         let metadata = project.layers[0].text.as_ref().unwrap();

@@ -29,6 +29,7 @@ const HELP: &str = r#"penplot | offline pen-plotter compiler
   --threshold 0..255   raster foreground brightness cutoff (default 128)
   --invert             select bright instead of dark pixels
   --trace outline|centerline   trace raster contours (default) or single strokes
+  --pen-width MM      omit narrower raster details and inset fill (0=off, up to 3 mm)
   --raster threshold|clean|color   classic trace, clean line art, or color hatch
   --clean-radius PX    local background radius 2..128 (default 16)
   --ink-contrast N     local ink contrast 1..80 (default 12; lower keeps faint ink)
@@ -167,6 +168,14 @@ fn run(mut it: Args) -> Result<(), String> {
             "--air-run" => air = true,
             "--colors-dir" => colors_dir = Some(PathBuf::from(value(&mut it, "--colors-dir")?)),
             "--hatch-only" => hatch_only = true,
+            "--pen-width" => {
+                let width = num(&mut it, "--pen-width")?;
+                if !(0.0..=3.).contains(&width) {
+                    return Err("--pen-width must be 0..3 mm".into());
+                }
+                import.processing.pen_width_mm = width;
+                opts.pen_width_mm = width;
+            }
             "--raster" => {
                 import.processing.mode = match value(&mut it, "--raster")?.to_str() {
                     Some("threshold") => penplot::RasterMode::Threshold,

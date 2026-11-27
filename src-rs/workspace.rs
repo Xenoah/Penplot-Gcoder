@@ -154,21 +154,10 @@ impl Studio {
             ui.label("You can inspect the artwork layout in Edit. This profile does not expose runnable commands here.");
             return;
         }
-        if self.export_inspection.is_none() && self.can_export() {
-            self.inspect_gcode(self.air_first);
+        ui.heading("G-code Preview");
+        if !self.can_export(self.air_first) {
+            ui.colored_label(WARN, self.export_unavailable_reason(self.air_first));
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("G-code Preview");
-            if ui
-                .add_enabled(
-                    self.can_export(),
-                    egui::Button::new("Refresh from current job"),
-                )
-                .clicked()
-            {
-                self.inspect_gcode(self.air_first);
-            }
-        });
         if let Some(inspection) = &mut self.export_inspection {
             egui::ScrollArea::vertical()
                 .id_salt("gcode_workspace")
@@ -177,12 +166,12 @@ impl Studio {
                     inspection.show(ui, self.revision);
                 });
         } else {
-            ui.label("Generate a route by importing or drawing artwork.");
-            ui.small("This workspace inspects emitted commands. Editing does not overwrite a saved preview.");
+            ui.label("Import or draw artwork, then click 1. Generate G-code.");
+            ui.small("Review the generated commands here, then use 3. Export. Edits require a new generation.");
         }
     }
 
-    pub(super) fn export_unavailable_reason(&self) -> String {
+    pub(super) fn generation_unavailable_reason(&self) -> String {
         if self.text_dialog.is_some() || self.raster_import.is_busy() {
             "Apply or cancel the pending text/image import before exporting.".into()
         } else if self.import_dialog.is_some() || self.import_task.is_some() {
@@ -202,29 +191,60 @@ impl Studio {
         }
     }
 
-    pub(super) fn request_export(&mut self, air_run: bool) {
-        let pending_edit = self.text_dialog.is_some()
-            || self.raster_import.is_busy()
-            || self.import_dialog.is_some()
-            || self.import_task.is_some()
-            || self.placement_drag.is_some();
-        if !pending_edit
-            && (self.preview_dirty || self.plan_task.is_some())
-            && self.layers.iter().any(|layer| layer.visible)
-        {
-            self.pending_export = Some(air_run);
-            self.status = "Preparing the current route before export…".into();
-        } else {
-            self.pending_export = None;
-            self.save_gcode(air_run);
+    pub(super) fn can_request_generation(&self) -> bool {
+        self.layers.iter().any(|l| l.visible)
+            && self.text_dialog.is_none()
+            && !self.raster_import.is_busy()
+            && self.import_dialog.is_none()
+            && self.import_task.is_none()
+            && self.placement_drag.is_none()
+            && self.profile.export_blocker().is_none()
+    }
+
+    pub(super) fn can_export(&self, air: bool) -> bool {
+        self.can_generate()
+            && self
+                .export_inspection
+                .as_ref()
+                .is_some_and(|i| i.revision == self.revision && i.air_run == air)
+    }
+
+    pub(super) fn export_unavailable_reason(&self, air: bool) -> String {
+        if !self.can_generate() {
+            return self.generation_unavailable_reason();
+        }
+        match &self.export_inspection {
+            None => "Click Generate G-code, review its Preview, then Export.".into(),
+            Some(i) if i.revision != self.revision || i.air_run != air => {
+                "The job or Air run setting changed. Generate G-code again before Export.".into()
+            }
+            _ => "Generated G-code is ready to export.".into(),
         }
     }
 
-    pub(super) fn finish_pending_export(&mut self) {
-        if self.pending_export.is_some() && !self.preview_dirty && self.plan_task.is_none() {
-            let air_run = self.pending_export.take().unwrap();
-            // Revalidate after the worker completes; never save an older snapshot.
-            self.save_gcode(air_run);
+    pub(super) fn export_commands(&self, air: bool) -> Result<Arc<Output>, String> {
+        if !self.can_export(air) {
+            return Err(self.export_unavailable_reason(air));
+        }
+        Ok(self.export_inspection.as_ref().unwrap().commands.clone())
+    }
+
+    pub(super) fn request_generation(&mut self, air_run: bool) {
+        if self.can_request_generation() && (self.preview_dirty || self.plan_task.is_some()) {
+            self.pending_generation = Some((self.revision, air_run));
+            self.status = "Generating the current job…".into();
+        } else {
+            self.pending_generation = None;
+            self.inspect_gcode(air_run);
+        }
+    }
+
+    pub(super) fn finish_pending_generation(&mut self) {
+        if self.pending_generation.is_some() && !self.preview_dirty && self.plan_task.is_none() {
+            let (revision, air_run) = self.pending_generation.take().unwrap();
+            if revision == self.revision {
+                self.inspect_gcode(air_run);
+            }
         }
     }
 }
@@ -234,28 +254,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn changing_machine_presets_cancels_pending_export_without_losing_artwork() {
+    fn generate_then_preview_then_export_reuses_exact_commands_and_edits_require_regeneration() {
         let mut app = Studio::default();
         app.add_mark(vec![Point::new(10., 10.), Point::new(30., 20.)], false)
             .unwrap();
         app.rebuild();
-        assert!(app.can_export());
+        assert!(app.can_generate());
+        assert!(!app.can_export(false));
+        app.switch_workspace(Workspace::Preview);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.preview_workspace(ui));
+        });
+        assert!(app.export_inspection.is_none()); // Visiting Preview cannot generate.
+        app.request_generation(false);
+        assert_eq!(app.workspace, Workspace::Preview);
+        let saved = app.export_commands(false).unwrap();
+        assert!(Arc::ptr_eq(
+            &saved,
+            &app.export_inspection.as_ref().unwrap().commands
+        ));
+        assert!(!app.can_export(true));
+        app.options.x += 3.;
+        app.invalidate();
+        app.rebuild();
+        assert!(app.export_commands(false).is_err());
+        app.request_generation(false);
+        assert_ne!(saved.gcode, app.export_commands(false).unwrap().gcode);
+        app.request_generation(true);
+        assert!(app.can_export(true) && !app.can_export(false));
+        let air = app.export_commands(true).unwrap();
+        assert_eq!(air.gcode, app.generate_commands(true).unwrap().gcode);
+    }
+
+    #[test]
+    fn edits_cancel_queued_generation_and_old_snapshots_stay_unexportable() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10., 10.), Point::new(30., 20.)], false)
+            .unwrap();
+        app.request_generation(false);
+        assert!(app.pending_generation.is_some());
+        app.options.x += 2.;
+        app.invalidate();
+        assert!(app.pending_generation.is_none());
+        app.rebuild();
+        app.finish_pending_generation();
+        assert!(app.export_inspection.is_none());
+        assert!(!app.can_export(false));
+    }
+
+    #[test]
+    fn changing_machine_presets_cancels_pending_generation_without_losing_artwork() {
+        let mut app = Studio::default();
+        app.add_mark(vec![Point::new(10., 10.), Point::new(30., 20.)], false)
+            .unwrap();
+        app.rebuild();
+        assert!(app.can_generate());
         app.inspect_gcode(false);
 
-        app.pending_export = Some(false);
+        app.pending_generation = Some((app.revision, false));
         app.air_first = false;
         app.apply_machine_preset(Some(MachinePreset::BambuP1s));
         app.rebuild();
-        assert!(app.pending_export.is_none());
-        assert!(!app.can_export());
+        assert!(app.pending_generation.is_none());
+        assert!(!app.can_generate());
         assert!(app.air_first);
         assert!(
-            app.export_commands(false)
+            app.generate_commands(false)
                 .unwrap_err()
                 .contains("layout-only")
         );
         assert!(
-            app.export_commands(true)
+            app.generate_commands(true)
                 .unwrap_err()
                 .contains("layout-only")
         );
@@ -264,21 +334,24 @@ mod tests {
 
         app.apply_machine_preset(Some(MachinePreset::VoxelabAries));
         app.rebuild();
-        assert!(!app.can_export());
-        assert!(app.export_unavailable_reason().contains("measured Draw Z"));
+        assert!(!app.can_generate());
+        assert!(
+            app.generation_unavailable_reason()
+                .contains("measured Draw Z")
+        );
         app.profile.pen_up_z = 6.;
         app.profile.pen_down_z = 2.;
         app.invalidate();
         app.rebuild();
-        assert!(app.can_export());
+        assert!(app.can_generate());
         assert!(
-            app.export_commands(false)
+            app.generate_commands(false)
                 .unwrap()
                 .gcode
                 .contains("G1 Z2.000")
         );
         assert!(
-            !app.export_commands(true)
+            !app.generate_commands(true)
                 .unwrap()
                 .gcode
                 .contains("G1 Z2.000")
@@ -298,7 +371,7 @@ mod tests {
         app.inspect_gcode(false);
         let revision = app.revision;
         let history = app.undo.len();
-        let snapshot = app.export_commands(false).unwrap();
+        let snapshot = app.generate_commands(false).unwrap();
         let inspection_ptr = app.export_inspection.as_ref().unwrap() as *const ExportInspection;
         for workspace in [Workspace::Import, Workspace::Preview, Workspace::Edit] {
             app.switch_workspace(workspace);
@@ -308,17 +381,17 @@ mod tests {
             assert_eq!(app.import_options.threshold, 87);
             assert_eq!(app.frame.zoom, 2.25);
             assert_eq!(app.frame.shift, Vec2::new(45., -12.));
-            assert!(app.can_export());
-            assert_eq!(app.export_commands(false).unwrap().gcode, snapshot.gcode);
+            assert!(app.can_generate());
+            assert_eq!(app.generate_commands(false).unwrap().gcode, snapshot.gcode);
         }
         app.options.x = f64::NAN;
         app.invalidate();
         app.rebuild();
         for workspace in [Workspace::Edit, Workspace::Import, Workspace::Preview] {
             app.switch_workspace(workspace);
-            assert!(!app.can_export());
+            assert!(!app.can_generate());
             assert!(
-                app.export_commands(false)
+                app.generate_commands(false)
                     .unwrap_err()
                     .contains("Cannot export")
             );
@@ -335,14 +408,14 @@ mod tests {
         app.add_mark(vec![Point::new(10., 10.), Point::new(30., 20.)], false)
             .unwrap();
         app.rebuild();
-        assert!(app.can_export());
+        assert!(app.can_generate());
         app.options.scale = f64::NAN;
         app.invalidate();
-        app.request_export(false);
-        assert_eq!(app.pending_export, Some(false));
+        app.request_generation(false);
+        assert_eq!(app.pending_generation, Some((app.revision, false)));
         app.rebuild();
-        app.finish_pending_export();
-        assert!(app.pending_export.is_none());
+        app.finish_pending_generation();
+        assert!(app.pending_generation.is_none());
         assert!(app.output.is_none());
         assert!(app.status.contains("Cannot export"));
         assert!(app.export_inspection.is_none());
@@ -360,7 +433,7 @@ mod tests {
                 let revision = app.revision;
                 let history = app.undo.len();
                 let original = app.options.clone();
-                let commands = app.export_commands(false).unwrap();
+                let commands = app.generate_commands(false).unwrap();
                 let bounds = app.placement_bounds().unwrap();
                 app.placement_drag = Some(PlacementDrag {
                     bounds,
@@ -378,15 +451,15 @@ mod tests {
                         PlacementMotion::Move(Point::new(3., 5.))
                     },
                 });
-                assert!(!app.can_export());
+                assert!(!app.can_generate());
                 app.switch_workspace(destination);
                 assert!(app.placement_drag.is_none());
                 assert_eq!(app.options, original);
                 assert_eq!(app.revision, revision);
                 assert_eq!(app.undo.len(), history);
                 assert!(!app.project_dirty);
-                assert!(app.can_export());
-                assert_eq!(app.export_commands(false).unwrap().gcode, commands.gcode);
+                assert!(app.can_generate());
+                assert_eq!(app.generate_commands(false).unwrap().gcode, commands.gcode);
             }
         }
     }
@@ -398,7 +471,7 @@ mod tests {
             .unwrap();
         app.rebuild();
         let saved_revision = app.revision;
-        let commands = app.export_commands(false).unwrap();
+        let commands = app.generate_commands(false).unwrap();
         app.open_gcode_snapshot(Some(PathBuf::from("saved.GCODE")), false, commands);
         app.switch_workspace(Workspace::Edit);
         app.options.x += 5.;
@@ -421,7 +494,7 @@ mod tests {
         app.air_first = true;
         app.inspect_gcode(app.air_first);
         let inspection = app.export_inspection.as_ref().unwrap();
-        assert_eq!(inspection.title(), "Inspect air-run G-code");
+        assert_eq!(inspection.title(), "Generated air-run G-code");
         assert_eq!(inspection.revision, app.revision);
         assert!(inspection.path.is_none());
     }

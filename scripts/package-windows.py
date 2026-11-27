@@ -62,9 +62,9 @@ def main():
         raise SystemExit("Expected Windows x64 MSVC or GNU target")
     files = {name: Path(binary_dir) / name for name in ("penplot-studio.exe", "penplot.exe")}
     for name in ("README.md", "docs/K9.md", "docs/MACHINE-PRESETS.md",
-                 "docs/BUCKET-FILL.ja.md", "examples/bucket-card.svg",
+                 "docs/BUCKET-FILL.ja.md", "docs/PEN-WIDTH.ja.md", "examples/bucket-card.svg",
                  "docs/TRAVEL_SMOOTHING.ja.md", "docs/RASTER-COLOR.ja.md",
-                 "docs/releases/v0.10.0.md", "docs/releases/v0.11.0.md", "scripts/make-raster-examples.py",
+                 "docs/releases/v0.10.0.md", "docs/releases/v0.11.0.md", "docs/releases/v0.12.0.md", "scripts/make-raster-examples.py",
                  "examples/color-card.png", "examples/clean-scan.png",
                  "examples/alignment-card.svg", "examples/calibration.dxf"):
         files[name] = Path(name)

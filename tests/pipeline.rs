@@ -538,6 +538,7 @@ fn raster_cutoff_does_not_restore_hatch_inside_a_removed_hole() {
         0,
         penplot::RasterSettings {
             pattern: None,
+            pen_width_mm: 0.,
             outline: true,
             fill: Fill::Lines,
             hatch_spacing: 0.25,

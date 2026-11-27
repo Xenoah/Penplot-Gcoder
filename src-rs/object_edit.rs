@@ -779,9 +779,9 @@ mod tests {
         assert_eq!(app.layers[0].strokes[0], original[0]);
         assert_eq!(app.layers[0].strokes[1], original[2]);
         assert!(app.selected.is_none());
-        assert!(app.output.is_none() && !app.can_export());
+        assert!(app.output.is_none() && !app.can_generate());
         assert!(app.route_targets.is_empty() && app.planned.is_empty());
-        assert!(app.project_dirty && app.preview_dirty && !app.can_export());
+        assert!(app.project_dirty && app.preview_dirty && !app.can_generate());
         frame(
             &context,
             &mut app,
@@ -926,7 +926,7 @@ mod tests {
         app.selected = Some(Selection::Layer(1));
         app.invalidate();
         app.rebuild();
-        let initial_commands = app.export_commands(false).unwrap().gcode.clone();
+        let initial_commands = app.generate_commands(false).unwrap().gcode.clone();
         let fixed = app.planned[1].points.clone();
         let ctx = egui::Context::default();
         let panel = |app: &mut Studio, events| {
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(app.planned.len(), 1);
         assert_eq!(app.planned[0].points, fixed);
         assert!(
-            !app.export_commands(false)
+            !app.generate_commands(false)
                 .unwrap()
                 .gcode
                 .contains("X20.000 Y20.000")
@@ -975,7 +975,10 @@ mod tests {
         panel(&mut app, vec![mouse(false)]);
         assert!(app.layers[0].visible);
         app.rebuild();
-        assert_eq!(app.export_commands(false).unwrap().gcode, initial_commands);
+        assert_eq!(
+            app.generate_commands(false).unwrap().gcode,
+            initial_commands
+        );
     }
 
     #[test]
@@ -1141,7 +1144,7 @@ mod tests {
         }
         assert!(app.delete_object(Selection::Layer(0)));
         assert!(app.layers.is_empty() && app.planned.is_empty() && app.route_targets.is_empty());
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         app.rebuild();
         assert!(app.output.is_none());
         assert!(penplot::generate_air_run(&app.planned, &app.profile).is_err());
@@ -1191,7 +1194,7 @@ mod tests {
         let mut app = marks();
         let ctx = egui::Context::default();
         app.raster_import.extend([PathBuf::from("queued.png")]);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         frame(
             &ctx,
             &mut app,
@@ -1208,7 +1211,7 @@ mod tests {
             revision: app.revision,
             motion: PlacementMotion::Move(Point::new(1., 2.)),
         });
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         frame(
             &ctx,
             &mut app,
@@ -1218,12 +1221,12 @@ mod tests {
         app.placement_drag = None;
         let (sender, receiver) = mpsc::channel();
         app.plan_task = Some(receiver);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         assert!(app.delete_object(Selection::Mark {
             layer: 0,
             stroke: 0
         }));
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         assert!(app.route_targets.is_empty());
         drop(sender);
     }

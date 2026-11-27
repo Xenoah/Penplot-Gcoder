@@ -68,6 +68,15 @@ pub fn raster(bytes: &[u8], options: &ImportOptions) -> Result<Artwork, String> 
     }
     drop(rgba);
     let mm = 25.4 / options.dpi;
+    crate::pen_width::open_mask(
+        &mut mask,
+        width as usize,
+        height as usize,
+        options.processing.pen_width_mm / mm,
+    )?;
+    if !mask.contains(&1) && options.processing.pen_width_mm > 0. {
+        return Err("No ink remains at this pen width. Reduce Pen width or turn off Ignore thinner details.".into());
+    }
     let mode = if options.processing.mode == crate::RasterMode::CleanLine {
         TraceMode::Centerline
     } else {

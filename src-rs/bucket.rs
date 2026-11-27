@@ -16,16 +16,22 @@ pub enum Pattern {
 #[serde(default, deny_unknown_fields)]
 pub struct PatternSettings {
     pub pattern: Pattern,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clip_to_pen: bool,
     /// Relative coverage, 1..100. 100 maps to 75% geometric coverage.
     pub density: f64,
     pub pen_width_mm: f64,
     pub dot_diameter_mm: f64,
     pub angle_deg: f64,
 }
+fn is_false(value: &bool) -> bool {
+    !value
+}
 impl Default for PatternSettings {
     fn default() -> Self {
         Self {
             pattern: Pattern::Diagonal,
+            clip_to_pen: false,
             density: 35.,
             pen_width_mm: 0.3,
             dot_diameter_mm: 1.,

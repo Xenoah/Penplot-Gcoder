@@ -12,10 +12,13 @@ pub enum RasterMode {
     Color,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RasterProcessing {
     pub mode: RasterMode,
+    /// 0 disables physical-width filtering; otherwise millimeters at import DPI.
+    #[serde(default, skip_serializing_if = "width_off")]
+    pub pen_width_mm: f64,
     /// Local background radius in source pixels, independent of output DPI.
     pub radius: u32,
     pub contrast: u8,
@@ -26,10 +29,14 @@ pub struct RasterProcessing {
     /// Exclude near-white pixels only if all composited channels reach this value.
     pub background_cutoff: u8,
 }
+fn width_off(value: &f64) -> bool {
+    *value == 0.
+}
 impl Default for RasterProcessing {
     fn default() -> Self {
         Self {
             mode: RasterMode::Threshold,
+            pen_width_mm: 0.,
             radius: 16,
             contrast: 12,
             speckle: 3,
@@ -44,6 +51,9 @@ impl RasterProcessing {
         *self == Self::default()
     }
     pub fn validate(&self) -> Result<(), String> {
+        if !self.pen_width_mm.is_finite() || !(0.0..=3.).contains(&self.pen_width_mm) {
+            return Err("Image pen width must be 0 (off) to 3 mm".into());
+        }
         if !(2..=128).contains(&self.radius)
             || !(1..=80).contains(&self.contrast)
             || self.speckle > 100
@@ -258,6 +268,15 @@ pub(crate) fn colors(image: &RgbaImage, options: &ImportOptions) -> Result<Artwo
             .iter()
             .map(|p| u8::from(usize::from(*p) == i))
             .collect();
+        if !mask.contains(&1) {
+            continue;
+        }
+        crate::pen_width::open_mask(
+            &mut mask,
+            image.width() as usize,
+            image.height() as usize,
+            options.processing.pen_width_mm * options.dpi / 25.4,
+        )?;
         if !mask.contains(&1) {
             continue;
         }

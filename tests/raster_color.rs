@@ -48,6 +48,7 @@ fn png(image: &RgbaImage) -> Vec<u8> {
 fn settings() -> RasterSettings {
     RasterSettings {
         pattern: None,
+        pen_width_mm: 0.,
         fill: Fill::Lines,
         outline: false,
         hatch_spacing: 0.5,

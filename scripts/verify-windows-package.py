@@ -17,6 +17,6 @@ with zipfile.ZipFile(archive) as bundle:
         pe = struct.unpack_from('<I', exe, 0x3c)[0]
         assert exe[pe:pe+4] == b'PE\0\0', name
         assert struct.unpack_from('<H', exe, pe+4)[0] == 0x8664, 'Expected AMD64 PE'
-    for name in ['README.md', 'docs/RASTER-COLOR.ja.md', 'examples/color-card.png', 'examples/clean-scan.png', 'THIRD-PARTY-NOTICES.txt']:
+    for name in ['README.md', 'docs/RASTER-COLOR.ja.md', 'docs/PEN-WIDTH.ja.md', 'docs/releases/v0.12.0.md', 'examples/color-card.png', 'examples/clean-scan.png', 'THIRD-PARTY-NOTICES.txt']:
         assert bundle.read(name), f'Empty or missing: {name}'
 print(f'Validated v{version} Windows x64 ZIP from {expected_sha}')

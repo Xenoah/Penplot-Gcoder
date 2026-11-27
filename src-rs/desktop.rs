@@ -137,7 +137,7 @@ struct Studio {
     profile: Profile,
     options: JobOptions,
     workspace: Workspace,
-    pending_export: Option<bool>,
+    pending_generation: Option<(u64, bool)>,
     tools: Tool,
     bucket_defaults: penplot::PatternSettings,
     grayscale_preview: bool,
@@ -193,9 +193,12 @@ impl Default for Studio {
             profile: Profile::default(),
             options: JobOptions::default(),
             workspace: Workspace::Edit,
-            pending_export: None,
+            pending_generation: None,
             tools: Tool::Pan,
-            bucket_defaults: penplot::PatternSettings::default(),
+            bucket_defaults: penplot::PatternSettings {
+                clip_to_pen: true,
+                ..Default::default()
+            },
             grayscale_preview: false,
             frame: Camera::default(),
             isometric: false,
@@ -315,7 +318,7 @@ impl Studio {
         }
         self.poll_plan(ctx);
         self.step_player(ctx);
-        self.finish_pending_export();
+        self.finish_pending_generation();
         egui::TopBottomPanel::top("header").show(ctx, |ui| self.header(ui, ctx));
         egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| self.timeline(ui));
         self.workspace_ui(ctx);
@@ -400,29 +403,53 @@ impl Studio {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let enabled = self.can_export();
-            let title = if self.air_first {
-                "Export air run…"
-            } else {
-                "Export G-code…"
-            };
+            ui.checkbox(&mut self.air_first, "Air run")
+                .on_hover_text("Generate a pen-up-only file for checking clearance.");
             if ui
-                .button(title)
-                .on_hover_text("Export the current document from any workspace.")
+                .add_enabled(
+                    self.can_request_generation(),
+                    egui::Button::new("1. Generate G-code"),
+                )
                 .clicked()
             {
-                self.request_export(self.air_first);
+                self.request_generation(self.air_first);
             }
-            if ui.add_enabled(enabled, egui::Button::new("Export colors…"))
-                .on_hover_text("Write a NEW folder with one G-code file per pen and a pen-change guide. Keeps paper XY fixed.")
-                .clicked() { self.save_colors(self.air_first); }
-            ui.checkbox(&mut self.air_first, "Air run first")
-                .on_hover_text("Air run follows the same XY route but never lowers the pen.");
             if ui
-                .add_enabled(enabled, egui::Button::new("Inspect G-code"))
+                .add_enabled(
+                    self.export_inspection.is_some(),
+                    egui::Button::new("2. Preview"),
+                )
                 .clicked()
             {
-                self.inspect_gcode(self.air_first);
+                self.switch_workspace(Workspace::Preview);
+            }
+            if ui
+                .add_enabled(
+                    self.can_export(self.air_first),
+                    egui::Button::new("3. Export…"),
+                )
+                .on_hover_text("Save exactly the generated commands shown in Preview.")
+                .clicked()
+            {
+                self.save_gcode(self.air_first);
+            }
+            if ui
+                .add_enabled(
+                    self.can_export(self.air_first),
+                    egui::Button::new("Export colors…"),
+                )
+                .on_hover_text(
+                    "Export the generated job as separate pen passes at fixed paper coordinates.",
+                )
+                .clicked()
+            {
+                self.save_colors(self.air_first);
+            }
+            if self.pending_generation.is_some() {
+                ui.spinner();
+                ui.label("Generating…");
+            } else if self.export_inspection.is_some() && !self.can_export(self.air_first) {
+                ui.colored_label(WARN, "Changed — generate again before export");
             }
         });
         if let Some(reason) = self.profile.export_blocker() {
@@ -692,6 +719,7 @@ impl Studio {
     }
 
     fn invalidate(&mut self) {
+        self.pending_generation = None;
         self.placement_drag = None;
         self.preview_dirty = true;
         self.project_dirty = true;
@@ -875,7 +903,7 @@ impl Studio {
         self.placement_drag = None;
         self.air_first = true;
         self.status = format!("Opened {}.", path.display());
-        self.pending_export = None;
+        self.pending_generation = None;
         self.project_file = Some(path);
         self.invalidate();
         self.project_dirty = false;
@@ -935,21 +963,21 @@ impl Studio {
                     ui.label("1. Import で図面を読み込みます。Fit to usable bed で描画範囲に収めます。");
                     ui.label("2. Machine で原点から実測した描画 Z・退避 Z、オフセット、可動範囲を設定します。");
                     ui.label("3. 機械側でペンを逃がして原点復帰し、まず Air run（ペン上げのみ）で干渉を確認します。");
-                    ui.label("4. 問題なければ Air run first を外して描画用 G-code を出力します。");
+                    ui.label("4. Generate G-code → Preview → Export の順に進みます。描画用は Air run を外して再生成します。");
                 } else {
                     ui.label("1. Import your drawing and use Fit to usable bed if needed.");
                     ui.label("2. Enter measured Draw Z, Clearance Z, offsets and travel limits in Machine before running on hardware.");
                     ui.label("3. Home manually with clearance; export and verify a pen-up air run.");
-                    ui.label("4. Uncheck Air run first only when ready to export the drawing file.");
+                    ui.label("4. Generate G-code, inspect Preview, then Export. Uncheck Air run and generate again for the drawing file.");
                 }
                 ui.separator();
                 ui.small("This app exports files only. It does not connect to or control the printer.");
             });
     }
 
-    fn export_commands(&self, air_run: bool) -> Result<Arc<Output>, String> {
-        if !self.can_export() {
-            return Err(self.export_unavailable_reason());
+    fn generate_commands(&self, air_run: bool) -> Result<Arc<Output>, String> {
+        if !self.can_generate() {
+            return Err(self.generation_unavailable_reason());
         }
         if air_run {
             penplot::generate_with_travel(
@@ -974,15 +1002,15 @@ impl Studio {
     }
 
     fn inspect_gcode(&mut self, air_run: bool) {
-        match self.export_commands(air_run) {
+        match self.generate_commands(air_run) {
             Ok(output) => self.open_gcode_snapshot(None, air_run, output),
             Err(error) => self.status = error,
         }
     }
 
     fn save_colors(&mut self, air: bool) {
-        if !self.can_export() {
-            self.status = self.export_unavailable_reason();
+        if !self.can_export(air) {
+            self.status = self.export_unavailable_reason(air);
             return;
         }
         let jobs = match penplot::color_jobs(
@@ -1435,7 +1463,7 @@ impl Studio {
             }
         }
         if changed {
-            self.pending_export = None;
+            self.pending_generation = None;
             self.invalidate();
             ui.ctx().request_repaint();
         }
@@ -1449,7 +1477,7 @@ impl Studio {
     }
 
     fn apply_machine_preset(&mut self, preset: Option<MachinePreset>) {
-        self.pending_export = None;
+        self.pending_generation = None;
         self.profile = preset.map(Profile::for_machine).unwrap_or_else(Profile::k9);
         self.profile_notices.clear();
         if let Some(preset) = preset {
@@ -1469,7 +1497,7 @@ impl Studio {
             .and_then(|text| Profile::from_json(&text))
         {
             Ok((profile, notices)) => {
-                self.pending_export = None;
+                self.pending_generation = None;
                 if profile.machine_preset.is_some() {
                     self.air_first = true;
                 }
@@ -1582,6 +1610,13 @@ impl Studio {
                     .changed();
             });
         if draft.fill != Fill::None {
+            let before_width = draft.pen_width_mm;
+            raster_ui::pen_width_controls(
+                ui,
+                &mut draft.pen_width_mm,
+                "Keep fill inside pen-width clearance",
+            );
+            changed |= draft.pen_width_mm != before_width;
             changed |= number(ui, "Spacing (mm)", &mut draft.hatch_spacing, 0.1);
             changed |= number(ui, "Angle (deg)", &mut draft.hatch_angle, 1.0);
             ui.small("Hatching applies to closed, filled shapes.");
@@ -1598,7 +1633,7 @@ impl Studio {
         combine(&self.layers)
     }
 
-    fn can_export(&self) -> bool {
+    fn can_generate(&self) -> bool {
         self.profile.export_blocker().is_none()
             && self.output.is_some()
             && !self.planned.is_empty()
@@ -3037,17 +3072,17 @@ mod tests {
         app.add_mark(vec![Point::new(10.0, 10.0), Point::new(25.0, 10.0)], false)
             .unwrap();
         app.rebuild();
-        let off = app.export_commands(true).unwrap();
+        let off = app.generate_commands(true).unwrap();
         assert!(!off.gcode.contains("M203"));
         app.inspect_gcode(true);
         let old_preview_revision = app.export_inspection.as_ref().unwrap().revision;
 
         app.profile.k9_start_gcode.as_mut().unwrap().enabled = true;
         app.invalidate();
-        assert!(app.export_commands(true).is_err());
+        assert!(app.generate_commands(true).is_err());
         assert_ne!(app.revision, old_preview_revision);
         app.rebuild();
-        let on = app.export_commands(true).unwrap();
+        let on = app.generate_commands(true).unwrap();
         assert!(on.gcode.contains("M203 X100 Y100"));
         assert_eq!(
             off.gcode
@@ -3066,7 +3101,7 @@ mod tests {
         app.profile.k9_start_gcode.as_mut().unwrap().code = "G91".into();
         app.invalidate();
         app.rebuild();
-        assert!(app.export_commands(false).is_err() && app.export_commands(true).is_err());
+        assert!(app.generate_commands(false).is_err() && app.generate_commands(true).is_err());
         assert!(app.error.as_ref().unwrap().contains("K9 start G-code"));
     }
 
@@ -3074,11 +3109,11 @@ mod tests {
     fn export_requires_current_valid_route_without_a_manual_confirmation() {
         let mut app = Studio::default();
         assert!(app.air_first);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         app.add_mark(vec![Point::new(10.0, 10.0), Point::new(25.0, 10.0)], false)
             .unwrap();
         app.rebuild();
-        assert!(app.can_export());
+        assert!(app.can_generate());
         assert!(penplot::generate_air_run(&app.planned, &app.profile).is_ok());
         let old_report = calculate_plan(app.revision, &app.snapshot(), &app.profile);
         let (sender, receiver) = mpsc::channel();
@@ -3086,7 +3121,7 @@ mod tests {
         app.plan_task = Some(receiver);
         app.invalidate();
         app.poll_plan(&egui::Context::default());
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         assert!(
             app.planned.is_empty(),
             "stale route must not be shown or exported"
@@ -3102,16 +3137,16 @@ mod tests {
         original.rebuild();
         let project = Project::from_json(&original.as_project().to_json().unwrap()).unwrap();
         original.air_first = false;
-        assert!(original.can_export());
+        assert!(original.can_generate());
         original.apply_project(PathBuf::from("example.penplot"), project);
         assert!(!original.project_dirty);
         assert!(original.preview_dirty);
-        assert!(!original.can_export());
+        assert!(!original.can_generate());
         assert!(original.air_first);
         assert!(original.undo.is_empty());
         assert_eq!(original.layers.len(), 1);
         original.rebuild();
-        assert!(original.can_export());
+        assert!(original.can_generate());
     }
 
     #[test]
@@ -3236,7 +3271,7 @@ mod tests {
             Point::new(bounds[0].x, bounds[0].y + 5.0)
         );
         app.placement_drag = Some(drag);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         let ctx = egui::Context::default();
         let _ = ctx.run(
             egui::RawInput {
@@ -3252,7 +3287,7 @@ mod tests {
             |ctx| app.update_ui(ctx),
         );
         assert!(app.placement_drag.is_none());
-        assert!(app.can_export());
+        assert!(app.can_generate());
         assert_eq!(app.revision, revision);
         assert_eq!(app.options.x, original.x);
         assert_eq!(app.options.y, original.y);
@@ -3308,7 +3343,7 @@ mod tests {
         );
         assert!(app.placement_drag.is_some());
         assert_eq!(app.undo.len(), history);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         draw(
             &mut app,
             vec![egui::Event::PointerMoved(to), pointer(to, false)],
@@ -3317,7 +3352,7 @@ mod tests {
         assert_eq!(app.undo.len(), history + 1);
         assert!((app.options.x - (30.0 + 3500.0 / f64::from(paper.width()))).abs() < 0.001);
         assert!((app.options.y - (30.0 + 2600.0 / f64::from(paper.height()))).abs() < 0.001);
-        assert!(!app.can_export());
+        assert!(!app.can_generate());
         let moved_x = app.options.x;
         app.undo();
         assert_eq!((app.options.x, app.options.y), (30.0, 30.0));
@@ -3350,7 +3385,7 @@ mod tests {
         assert_eq!(app.placement_bounds().unwrap()[0], Point::new(70., 65.));
         app.selected = Some(Selection::Layer(0));
         assert_eq!(app.placement_bounds().unwrap(), bounds_a);
-        let original = app.export_commands(false).unwrap().gcode.clone();
+        let original = app.generate_commands(false).unwrap().gcode.clone();
         let fixed = app.planned[1].points.clone();
         let fixed_command = "G1 X86.000 Y72.000 F1800.000";
         assert!(original.contains(fixed_command));
@@ -3416,13 +3451,13 @@ mod tests {
         app.rebuild();
         assert_eq!(app.planned[1].points, fixed);
         assert!(
-            app.export_commands(false)
+            app.generate_commands(false)
                 .unwrap()
                 .gcode
                 .contains(fixed_command)
         );
         assert!(
-            app.export_commands(false)
+            app.generate_commands(false)
                 .unwrap()
                 .gcode
                 .contains("G1 X60.000 Y60.000 F1800.000")
@@ -3432,12 +3467,12 @@ mod tests {
         reopened.apply_project(PathBuf::from("example.penplot"), project);
         reopened.rebuild();
         assert_eq!(
-            reopened.export_commands(false).unwrap().gcode,
-            app.export_commands(false).unwrap().gcode,
+            reopened.generate_commands(false).unwrap().gcode,
+            app.generate_commands(false).unwrap().gcode,
         );
         app.undo();
         app.rebuild();
-        assert_eq!(app.export_commands(false).unwrap().gcode, original);
+        assert_eq!(app.generate_commands(false).unwrap().gcode, original);
     }
 
     #[test]
@@ -3492,13 +3527,13 @@ mod tests {
             .unwrap();
         app.rebuild();
         let path = PathBuf::from("PLOT.GCODE");
-        let output = app.export_commands(false).unwrap();
+        let output = app.generate_commands(false).unwrap();
         assert!(Arc::ptr_eq(&output, app.output.as_ref().unwrap()));
         app.open_gcode_snapshot(Some(path.clone()), false, output);
         let exported = app.revision;
         app.options.x += 15.0;
         app.invalidate();
-        assert!(app.export_commands(false).is_err());
+        assert!(app.generate_commands(false).is_err());
         let current = app.export_inspection.as_ref().unwrap();
         assert_eq!(current.revision, exported);
         assert_ne!(current.revision, app.revision);
@@ -3510,7 +3545,7 @@ mod tests {
         let inspection = app.export_inspection.unwrap();
         assert_eq!(inspection.revision, app.revision);
         assert!(inspection.path.is_none());
-        assert_eq!(inspection.title(), "Inspect air-run G-code");
+        assert_eq!(inspection.title(), "Generated air-run G-code");
     }
 
     #[test]
@@ -3543,14 +3578,19 @@ mod tests {
         app.add_mark(vec![Point::new(30., 10.), Point::new(35., 5.)], false)
             .unwrap();
         app.rebuild();
-        assert!(app.export_commands(false).unwrap().curved_travel.is_empty());
+        assert!(
+            app.generate_commands(false)
+                .unwrap()
+                .curved_travel
+                .is_empty()
+        );
         app.record_layers();
         app.options.smooth_pen_up = true;
         app.invalidate();
-        assert!(app.export_commands(false).is_err());
+        assert!(app.generate_commands(false).is_err());
         app.rebuild();
-        let plot = app.export_commands(false).unwrap();
-        let air = app.export_commands(true).unwrap();
+        let plot = app.generate_commands(false).unwrap();
+        let air = app.generate_commands(true).unwrap();
         let curve = &plot.curved_travel[0];
         assert_eq!(curve.paper_points, air.curved_travel[0].paper_points);
         let mut points = Vec::new();

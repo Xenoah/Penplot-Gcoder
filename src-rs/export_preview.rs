@@ -145,8 +145,8 @@ impl CommandPreview {
 pub(crate) struct ExportInspection {
     pub(crate) path: Option<PathBuf>,
     pub(crate) revision: u64,
-    air_run: bool,
-    commands: Arc<Output>,
+    pub(crate) air_run: bool,
+    pub(crate) commands: Arc<Output>,
     preview: CommandPreview,
     show_travel: bool,
     show_commands: bool,
@@ -177,8 +177,8 @@ impl ExportInspection {
         match (self.path.is_some(), self.air_run) {
             (true, true) => "Exported air-run G-code",
             (true, false) => "Exported plot G-code",
-            (false, true) => "Inspect air-run G-code",
-            (false, false) => "Inspect plot G-code",
+            (false, true) => "Generated air-run G-code",
+            (false, false) => "Generated plot G-code",
         }
     }
 
