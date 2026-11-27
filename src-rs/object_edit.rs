@@ -618,20 +618,36 @@ impl Studio {
             && let Some(mut settings) = self.layers[index].raster.clone()
         {
             ui.separator();
-            section(ui, "IMAGE LAYER FILL");
-            if self.layers[index].strokes.iter().any(|s| s.filled) {
-                raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
+            if let Some(pattern) = &mut settings.pattern {
+                section(
+                    ui,
+                    if self.japanese {
+                        "選択領域の塗り"
+                    } else {
+                        "SELECTED REGION FILL"
+                    },
+                );
+                bucket_ui::controls(ui, pattern, self.japanese);
             } else {
-                ui.small("Centerline paths do not support hatching.");
+                section(ui, "IMAGE LAYER FILL");
+                if self.layers[index].strokes.iter().any(|s| s.filled) {
+                    raster_ui::raster_fill_controls(ui, &mut settings, "selected_raster_fill");
+                } else {
+                    ui.small("Centerline paths do not support hatching.");
+                }
             }
             if self.layers[index].raster.as_ref() != Some(&settings) {
                 self.record_layers();
                 self.layers[index].raster = Some(settings);
                 self.invalidate();
             }
-            ui.small(
-                "Reimport the original image to change trace mode, threshold, DPI, or inversion.",
-            );
+            if self.layers[index]
+                .raster
+                .as_ref()
+                .is_some_and(|r| r.pattern.is_none())
+            {
+                ui.small("Reimport the original image to change trace mode, threshold, DPI, or inversion.");
+            }
         }
     }
 }

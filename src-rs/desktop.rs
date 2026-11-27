@@ -23,6 +23,7 @@ use object_edit::{ObjectContext, Selection};
 mod workspace;
 use workspace::Workspace;
 
+mod bucket_ui;
 mod raster_ui;
 use raster_ui::RasterImport;
 
@@ -61,6 +62,7 @@ struct Layer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
+    Bucket,
     Pan,
     Transform,
     Rotate,
@@ -73,6 +75,7 @@ enum Tool {
 impl Tool {
     fn label(self) -> &'static str {
         match self {
+            Self::Bucket => "Bucket fill",
             Self::Pan => "Pan",
             Self::Transform => "Move / Scale",
             Self::Rotate => "Rotate",
@@ -89,6 +92,7 @@ impl Tool {
 
     fn label_localized(self, japanese: bool) -> &'static str {
         match (self, japanese) {
+            (Self::Bucket, true) => "バケツ塗り",
             (Self::Transform, true) => "移動・拡大縮小",
             (Self::Rotate, true) => "回転",
             _ => self.label(),
@@ -135,6 +139,8 @@ struct Studio {
     workspace: Workspace,
     pending_export: Option<bool>,
     tools: Tool,
+    bucket_defaults: penplot::PatternSettings,
+    grayscale_preview: bool,
     frame: Camera,
     isometric: bool,
     z_exaggeration: f64,
@@ -189,6 +195,8 @@ impl Default for Studio {
             workspace: Workspace::Edit,
             pending_export: None,
             tools: Tool::Pan,
+            bucket_defaults: penplot::PatternSettings::default(),
+            grayscale_preview: false,
             frame: Camera::default(),
             isometric: false,
             z_exaggeration: 3.0,
@@ -847,6 +855,10 @@ impl Studio {
                 }
             })
             .collect();
+        self.grayscale_preview = self
+            .layers
+            .iter()
+            .any(|l| l.raster.as_ref().is_some_and(|r| r.pattern.is_some()));
         self.options = project.options;
         self.profile = project.profile;
         self.import_options = project.import_options;
@@ -2128,7 +2140,9 @@ impl Studio {
                 self.fit_and_reset_view();
                 ui.ctx().request_repaint();
             }
+            ui.checkbox(&mut self.grayscale_preview, if self.japanese {"塗りプレビュー（グレー）"} else {"Grayscale fill preview"});
             let hint = match self.tools {
+                Tool::Bucket => "Click inside a closed region to apply the selected pattern",
                 Tool::Transform if self.japanese => {
                     "選択レイヤー：内側で移動 · 角で拡大縮小 · Shiftで軸固定 · Escで取消"
                 }
@@ -2188,8 +2202,18 @@ impl Studio {
         let painter = painter.with_clip_rect(base);
         let paper_rect = map.rect((0.0, 0.0, bed_x, bed_y));
         painter.rect_filled(base, 7.0, Color32::from_rgb(15, 21, 27));
-        painter.rect_filled(paper_rect, 0.0, PAPER);
-        self.grid(&painter, map, bed_x, bed_y);
+        painter.rect_filled(
+            paper_rect,
+            0.0,
+            if self.grayscale_preview {
+                Color32::WHITE
+            } else {
+                PAPER
+            },
+        );
+        if !self.grayscale_preview {
+            self.grid(&painter, map, bed_x, bed_y);
+        }
         painter.rect_stroke(
             paper_rect,
             0.0,
@@ -2256,7 +2280,9 @@ impl Studio {
             }
         } else {
             self.paint_route(&painter, map);
-            if self.tools != Tool::Pan {
+            if self.tools == Tool::Bucket {
+                self.bucket_canvas(&response, map);
+            } else if self.tools != Tool::Pan {
                 self.draw_on_bed(ui, &response, &painter, map);
             }
         }
@@ -2491,7 +2517,25 @@ impl Studio {
                 .selected
                 .zip(self.route_targets.get(index).copied().flatten())
                 .is_some_and(|(selected, target)| selected.contains(target));
-            let ink = if selected {
+            let ink = if let Some(pattern) = self.pattern_for_route(stroke) {
+                Ink::new(
+                    (pattern.pen_width_mm as f32 * map.scale).max(0.15),
+                    if active {
+                        Color32::BLACK
+                    } else {
+                        Color32::from_gray(190)
+                    },
+                )
+            } else if self.grayscale_preview {
+                Ink::new(
+                    1.25,
+                    if active {
+                        Color32::from_gray(65)
+                    } else {
+                        Color32::from_gray(190)
+                    },
+                )
+            } else if selected {
                 Ink::new(
                     2.4,
                     if penplot::ink_rgb(&stroke.layer).is_some() {
@@ -2871,7 +2915,7 @@ fn draft_geometry(tool: Tool, points: &[Point]) -> Option<(Vec<Point>, bool)> {
     let dx = last.x - first.x;
     let dy = last.y - first.y;
     let line = match tool {
-        Tool::Pan | Tool::Transform | Tool::Rotate => return None,
+        Tool::Bucket | Tool::Pan | Tool::Transform | Tool::Rotate => return None,
         Tool::Freehand if points.len() >= 2 => {
             let distinct = points
                 .iter()

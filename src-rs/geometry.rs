@@ -57,6 +57,8 @@ fn is_zero(value: &f64) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RasterSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<crate::PatternSettings>,
     #[serde(default = "default_outline", skip_serializing_if = "is_true")]
     pub outline: bool,
     #[serde(alias = "mode", alias = "fill_mode")]
@@ -78,6 +80,7 @@ impl Default for RasterSettings {
     fn default() -> Self {
         Self {
             fill: Fill::None,
+            pattern: None,
             outline: true,
             hatch_spacing: 1.,
             hatch_angle: 45.,
@@ -89,6 +92,7 @@ impl RasterSettings {
     pub fn from_job(o: &JobOptions) -> Self {
         Self {
             outline: true,
+            pattern: None,
             fill: o.fill,
             hatch_spacing: o.hatch_spacing,
             hatch_angle: o.hatch_angle,
@@ -96,6 +100,12 @@ impl RasterSettings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(pattern) = &self.pattern {
+            pattern.validate()?;
+            if self.outline || self.fill != Fill::Lines {
+                return Err("Bucket layers require pattern-only fill".into());
+            }
+        }
         if self.hatch_angle.is_finite() && (0.02..=1000.).contains(&self.hatch_spacing) {
             Ok(())
         } else {
@@ -268,23 +278,50 @@ pub fn plan_with_raster(
             .min((MAX_POINTS - out.iter().map(|s| s.points.len()).sum::<usize>()) / 2);
         for ((layer, group), rings) in groups {
             let settings = raster(layer).unwrap_or(&job);
+            if let Some(pattern) = &settings.pattern
+                && pattern.pattern == crate::Pattern::Dots
+            {
+                crate::bucket::dots(
+                    &rings,
+                    layer,
+                    group,
+                    pattern,
+                    &mut fill,
+                    &mut budget,
+                    allowed,
+                )?;
+                continue;
+            }
+            let spacing = settings
+                .pattern
+                .as_ref()
+                .map_or(settings.hatch_spacing, |p| p.spacing());
+            let angle = settings
+                .pattern
+                .as_ref()
+                .map_or(settings.hatch_angle, |p| p.angle_deg);
             hatch(
                 &rings,
                 layer,
                 group,
-                settings.hatch_spacing,
-                settings.hatch_angle,
+                spacing,
+                angle,
                 &mut fill,
                 &mut budget,
                 allowed,
             )?;
-            if settings.fill == Fill::Cross {
+            if settings.fill == Fill::Cross
+                || settings
+                    .pattern
+                    .as_ref()
+                    .is_some_and(|p| p.pattern == crate::Pattern::Cross)
+            {
                 hatch(
                     &rings,
                     layer,
                     group,
-                    settings.hatch_spacing,
-                    settings.hatch_angle + 90.,
+                    spacing,
+                    angle + 90.,
                     &mut fill,
                     &mut budget,
                     allowed,
@@ -296,12 +333,13 @@ pub fn plan_with_raster(
             settings.outline || settings.fill == Fill::None || !s.filled || !s.closed
         });
         out.extend(fill);
+        check_size(&out)?;
     }
     let mut removed_count = 0;
     let mut removed_mm = 0.0;
     if o.min_image_stroke_mm > 0.0 && !layers.is_empty() {
         out.retain(|stroke| {
-            if raster(&stroke.layer).is_none() {
+            if raster(&stroke.layer).is_none_or(|r| r.pattern.is_some()) {
                 return true;
             }
             let length: f64 = stroke.points.windows(2).map(|p| p[0].distance(p[1])).sum();
@@ -341,8 +379,16 @@ fn hatch(
     let forward = (-rad).sin_cos();
     let back = rad.sin_cos();
     let mut edges = Vec::new();
+    let mut paper_min = Point::new(f64::INFINITY, f64::INFINITY);
+    let mut paper_max = Point::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for ring in rings {
+        for point in &ring.points {
+            paper_min.x = paper_min.x.min(point.x);
+            paper_min.y = paper_min.y.min(point.y);
+            paper_max.x = paper_max.x.max(point.x);
+            paper_max.y = paper_max.y.max(point.y);
+        }
         for p in ring.points.windows(2) {
             let a = rotate(p[0], forward);
             let b = rotate(p[1], forward);
@@ -357,6 +403,16 @@ fn hatch(
     *budget = budget
         .checked_sub(rows.saturating_mul(edges.len().max(1)))
         .ok_or("Hatch too dense for this artwork; increase spacing or simplify")?;
+    // Inverse rotation can put an endpoint a few ulps outside its source
+    // bounds (notably y = -1e-15 on the paper edge). Every intersection is
+    // mathematically inside these bounds; keep that invariant exactly.
+    let paper_point = |x, y| {
+        let p = rotate(Point::new(x, y), back);
+        Point::new(
+            p.x.clamp(paper_min.x, paper_max.x),
+            p.y.clamp(paper_min.y, paper_max.y),
+        )
+    };
     let mut xs = Vec::new();
     for row in 0..rows {
         let y = lo + (row as f64 + 0.5) * spacing;
@@ -380,10 +436,7 @@ fn hatch(
                 (pair[1], pair[0])
             };
             out.push(Stroke {
-                points: vec![
-                    rotate(Point::new(a, y), back),
-                    rotate(Point::new(b, y), back),
-                ],
+                points: vec![paper_point(a, y), paper_point(b, y)],
                 layer: layer.to_owned(),
                 group,
                 closed: false,

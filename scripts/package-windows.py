@@ -62,8 +62,9 @@ def main():
         raise SystemExit("Expected Windows x64 MSVC or GNU target")
     files = {name: Path(binary_dir) / name for name in ("penplot-studio.exe", "penplot.exe")}
     for name in ("README.md", "docs/K9.md", "docs/MACHINE-PRESETS.md",
+                 "docs/BUCKET-FILL.ja.md", "examples/bucket-card.svg",
                  "docs/TRAVEL_SMOOTHING.ja.md", "docs/RASTER-COLOR.ja.md",
-                 "docs/releases/v0.10.0.md", "scripts/make-raster-examples.py",
+                 "docs/releases/v0.10.0.md", "docs/releases/v0.11.0.md", "scripts/make-raster-examples.py",
                  "examples/color-card.png", "examples/clean-scan.png",
                  "examples/alignment-card.svg", "examples/calibration.dxf"):
         files[name] = Path(name)
@@ -72,7 +73,7 @@ def main():
                  "docs/screenshots/studio-v0.5.0-gcode-preview.png"):
         if Path(name).exists():
             files[name] = Path(name)
-    for file in Path("docs/screenshots").glob("studio-v0.10.0-*.png"):
+    for file in Path("docs/screenshots").glob("studio-v0.*.png"):
         files[str(file).replace("\\", "/")] = file
     docs = {name: file.read_bytes() for name, file in files.items()}
     version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]

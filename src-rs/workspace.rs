@@ -66,10 +66,11 @@ impl Studio {
                     Workspace::Edit => {
                         section(ui, "TOOLBOX");
                         ui.add_enabled_ui(!self.raster_import.is_busy() && self.text_dialog.is_none(), |ui| {
-                            for tool in [Tool::Pan, Tool::Transform, Tool::Rotate, Tool::Line, Tool::Rectangle, Tool::Ellipse, Tool::Freehand] {
+                            for tool in [Tool::Pan, Tool::Transform, Tool::Rotate, Tool::Bucket, Tool::Line, Tool::Rectangle, Tool::Ellipse, Tool::Freehand] {
                                 if ui.add_sized([ui.available_width(), 28.0],
                                     egui::Button::selectable(self.tools == tool, tool.label_localized(self.japanese))).clicked() {
                                     self.tools = tool;
+                                    if tool == Tool::Bucket {self.isometric=false; self.grayscale_preview=true;}
                                     self.draft.clear();
                                     self.placement_drag = None;
                                 }
@@ -80,12 +81,13 @@ impl Studio {
                             ui.separator();
                             section(ui, "TOOL OPTIONS");
                             ui.small(match self.tools {
+                                Tool::Bucket => "Click a closed region to fill it with a monochrome pen pattern.",
                                 Tool::Transform => "Select a layer. Drag inside to move it, or drag a corner to scale it.",
                                 Tool::Rotate => "Drag the selected layer’s round handle. Shift snaps to 15°.",
                                 Tool::Pan => "Drag to pan. Scroll to zoom. Click a path to select.",
                                 _ => "Drag on the bed to draw. Escape cancels the current stroke.",
                             });
-                            self.placement_panel(ui);
+                            if self.tools == Tool::Bucket {self.bucket_panel(ui);} else {self.placement_panel(ui);}
                         });
                     }
                     Workspace::Import => {

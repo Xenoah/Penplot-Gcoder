@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
 const MAX_LAYERS: usize = 128;
 const MAX_NAME: usize = 512;
 const MAX_COORD: f64 = 1e8;
@@ -116,13 +116,19 @@ impl Project {
         serde_json::to_writer(
             &mut buffer,
             &SaveProject {
-                version: if !self.import_options.processing.is_default()
+                version: if self
+                    .layers
+                    .iter()
+                    .any(|l| l.raster.as_ref().is_some_and(|r| r.pattern.is_some()))
+                {
+                    SCHEMA
+                } else if !self.import_options.processing.is_default()
                     || self
                         .layers
                         .iter()
                         .any(|l| l.raster.as_ref().is_some_and(|r| !r.outline))
                 {
-                    SCHEMA
+                    4
                 } else if self.layers.iter().any(|layer| layer.text.is_some()) {
                     3
                 } else {
@@ -172,6 +178,17 @@ impl Project {
             }
             if let Some(settings) = &layer.raster {
                 settings.validate()?;
+                if settings.pattern.is_some()
+                    && (layer.strokes.is_empty()
+                        || layer.strokes.iter().any(|s| {
+                            !s.closed
+                                || !s.filled
+                                || s.points.len() < 4
+                                || crate::ink_rgb(&s.layer) != Some([0, 0, 0])
+                        }))
+                {
+                    return Err("Bucket fill requires saved closed black region boundaries".into());
+                }
             }
             if let Some(text) = &layer.text {
                 text.validate()?;

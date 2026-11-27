@@ -537,6 +537,7 @@ fn raster_cutoff_does_not_restore_hatch_inside_a_removed_hole() {
     let raster = penplot::RasterLayers::from([(
         0,
         penplot::RasterSettings {
+            pattern: None,
             outline: true,
             fill: Fill::Lines,
             hatch_spacing: 0.25,
